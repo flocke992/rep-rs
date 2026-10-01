@@ -2,27 +2,29 @@ use crate::problem_analysis::{calc_solution_l2_error, calc_solution_support_dist
 
 mod mp {
     // IMPROVEMENTS
-    // [ ] Implement auto normalization of columns of matrix A; A_tilde = W@A, where W diag
+    // [ ] Implement auto normalization of columns of the matrix A; A_tilde = W@A, where W is diag
     // [ ] Implement other greedy methods (OMP-LS, MP, Weak-MP, Thresholding)
-    // [ ] Improve performance by manageing ressources properly
+    // [ ] Improve performance by managing resources properly
     // [ ] Create a trait
 
     use faer::linalg::matmul::dot::inner_prod;
+    use faer::linalg::matmul::matmul;
     use faer::linalg::solvers::SolveLstsq;
-    use faer::{Col, Mat};
+    use faer::reborrow::*;
+    use faer::{Accum, Col, Mat, Par, unzip, zip};
 
-    pub struct Omp {
+    pub struct Omp<'a> {
         running_solution: Col<f64>,
         running_residual: Col<f64>,
         support: Vec<usize>,
         error_threshold: f64,
-        a_ref: Mat<f64>, // ToDo use a reference here.
+        a_ref: &'a Mat<f64>, // ToDo use a reference here.
         a_sup: Mat<f64>,
         b: Col<f64>,
     }
 
-    impl Omp {
-        pub fn init(a_ref: Mat<f64>, b: Col<f64>) -> Self {
+    impl<'a> Omp<'a> {
+        pub fn init(a_ref: &'a Mat<f64>, b: Col<f64>) -> Self {
             let running_solution = Col::zeros(a_ref.ncols());
             let a_sup = Mat::zeros(a_ref.nrows(), a_ref.ncols());
             Omp {
@@ -36,10 +38,14 @@ mod mp {
             }
         }
 
-        // maybe add to Result
         pub fn solve(&mut self) -> Option<Col<f64>> {
+            /*
+            Repeat the process until all columns are visited,
+            then we can surely produce b, unless b lies in the null-space of A.
+            */
             for _i in 0..self.a_ref.ncols() {
-                self.update_support();
+                let j_0 = self.sweep();
+                self.update_support(j_0);
                 self.update_running_solution();
                 self.update_residual();
                 if self.running_residual.squared_norm_l2()
@@ -75,8 +81,7 @@ mod mp {
             cand.0
         }
 
-        fn update_support(&mut self) {
-            let j_0 = self.sweep();
+        fn update_support(&mut self, j_0: usize) {
             self.a_sup
                 .col_mut(self.support.len())
                 .copy_from(self.a_ref.col(j_0));
@@ -84,14 +89,17 @@ mod mp {
         }
 
         fn update_running_solution(&mut self) {
-            //Solve Lstsq using the submatrix of a_sub that we support until now (using length of
-            //support. I think the b matrix we can give directly.
-            //ToDo: we need to optimize this heavily
+            /*
+            Solve Lstsq using the submatrix of a_sub that we support until now (using length of
+            support).
+            Even though we temporary allocate here this might not be to bad.
+            As we want to find a sparse solution, thus this step should not be called to many times.
+            The submatrix only grows by one column for each iteration.
+            */
             let qr = self
                 .a_sup
                 .submatrix(0, 0, self.a_ref.nrows(), self.support.len())
                 .col_piv_qr();
-            // ToDo: Is this sane?
             let x = qr.solve_lstsq(&self.b);
             for (x_i, &j_i) in x.iter().zip(self.support.iter()) {
                 self.running_solution[j_i] = *x_i;
@@ -99,9 +107,17 @@ mod mp {
         }
 
         fn update_residual(&mut self) {
-            // This is a simple expression but creates allocations.
-            // Use the faer::linalg module for inplace
-            self.running_residual = &self.b - &self.a_ref * &self.running_solution;
+            // Computes `1.0 * A @ running_solution` and stores the result in running_residual
+            matmul(
+                self.running_residual.rb_mut(),
+                Accum::Replace,
+                self.a_ref,
+                self.running_solution.rb(),
+                1.0,
+                Par::Seq,
+            );
+            // computes `running_residual = b - running_residual`
+            zip!(&mut self.running_residual, &self.b).for_each(|unzip!(r, b)| *r = b - *r);
         }
     }
 }
@@ -137,7 +153,8 @@ mod problem_analysis {
         let side = Uniform::new(start, end).unwrap();
         let ber = Bernoulli::new(0.5).unwrap();
 
-        for _ in 0..rng.random_range(1..=cardinality_bound) {
+        // for _ in 0..rng.random_range(1..=cardinality_bound) {
+        for _ in 1..=cardinality_bound {
             let i = rng.random_range(0..n);
             let x_i = side.sample(&mut rng)
                 * match ber.sample(&mut rng) {
@@ -149,13 +166,16 @@ mod problem_analysis {
         x
     }
 
-    pub fn gen_ax_b(nrows: usize, ncols: usize) -> (Mat<f64>, Col<f64>, Col<f64>) {
+    pub fn gen_ax_b(
+        nrows: usize,
+        ncols: usize,
+        cardinality_bound: usize,
+    ) -> (Mat<f64>, Col<f64>, Col<f64>) {
         //arbitrary set values
         let mean = 0.0;
         let std = 2.5;
         let start = 1.0;
         let end = 7.0;
-        let cardinality_bound = 50;
 
         let a = fill_mat_with_normals(nrows, ncols, mean, std);
         let x = fill_x_with_uniforms(ncols, start, end, cardinality_bound);
@@ -184,10 +204,11 @@ mod problem_analysis {
 }
 
 fn main() {
-    let (a, x, b) = problem_analysis::gen_ax_b(300, 500);
+    let (a, x, b) = problem_analysis::gen_ax_b(100, 500, 20);
+    // let (a, x, b) = problem_analysis::gen_ax_b(3, 10, 2);
     println!("{:?}", a.shape());
 
-    let mut problem = mp::Omp::init(a.cloned(), b);
+    let mut problem = mp::Omp::init(&a, b);
     if let Some(x_cand) = problem.solve() {
         let l2_error = calc_solution_l2_error(&x, &x_cand);
         let support_dist = calc_solution_support_dist(&x, &x_cand);
