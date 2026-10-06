@@ -84,7 +84,6 @@ mod mp {
                 .col_mut(self.support.len())
                 .copy_from(self.a_ref.col(j_0));
             self.support.push(j_0);
-            //self.support.insert(self.support.len(), j_0);
         }
 
         fn update_running_solution(&mut self) {
@@ -239,12 +238,10 @@ mod mp {
     }
 
     pub struct LsOmp<'a> {
-        running_solution: Col<f64>,
         residual_error: f64,
         support: Vec<usize>,
         error_threshold: f64,
         a_ref: &'a Mat<f64>,
-        // a_sup: Mat<f64>,
         b_ref: &'a Col<f64>,
         stored_inverse: Mat<f64>,
         as_space: Mat<f64>,
@@ -252,6 +249,8 @@ mod mp {
         sweep_x_opt: Col<f64>,
         sweep_residual: Col<f64>,
         as_b: Col<f64>,
+        // Candidate is organized as:
+        // (index, residual error, candidate inverse, candidate solution)
         candidate: (usize, f64, Mat<f64>, Col<f64>),
     }
 
@@ -262,7 +261,6 @@ mod mp {
             let nrows = b_ref.nrows();
             let expected_size = nrows / 5;
 
-            let running_solution = Col::zeros(0);
             let residual_error = b_ref.squared_norm_l2();
             let support = Vec::new();
             let stored_inverse = Mat::with_capacity(b_ref.nrows() / 5, b_ref.nrows() / 5);
@@ -283,7 +281,6 @@ mod mp {
             );
 
             LsOmp {
-                running_solution: running_solution,
                 residual_error: residual_error,
                 support: support,
                 error_threshold: error_threshold,
@@ -312,7 +309,7 @@ mod mp {
 
         fn return_reindexed_solution(&self) -> Col<f64> {
             let mut x = Col::zeros(self.a_ref.ncols());
-            for (x_i, &j_i) in self.running_solution.iter().zip(self.support.iter()) {
+            for (x_i, &j_i) in self.candidate.3.iter().zip(self.support.iter()) {
                 x[j_i] = *x_i;
             }
             x
@@ -365,8 +362,6 @@ mod mp {
                 self.residual_error = self.candidate.1;
                 self.stored_inverse
                     .resize_with(1, 1, |_, _| self.candidate.2[(0, 0)]);
-                self.running_solution
-                    .resize_with(1, |_| self.candidate.3[0]);
                 ai.copy_from(self.a_ref.col(self.candidate.0));
                 *ai_b = inner_prod(
                     ai.rb().transpose(),
@@ -421,9 +416,6 @@ mod mp {
                     |_, _| 0.0,
                 );
                 self.stored_inverse.copy_from(self.candidate.2.rb());
-                self.running_solution
-                    .resize_with(self.candidate.3.nrows(), |_| 0.0);
-                self.running_solution.copy_from(self.candidate.3.rb());
                 self.as_space
                     .col_mut(k)
                     .copy_from(self.a_ref.col(self.candidate.0));
