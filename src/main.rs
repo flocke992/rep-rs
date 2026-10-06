@@ -1,8 +1,4 @@
-use crate::{
-    mp::expand_inverse,
-    problem_analysis::{calc_solution_l2_error, calc_solution_support_dist},
-};
-use faer::prelude::*;
+use crate::problem_analysis::{calc_solution_l2_error, calc_solution_support_dist};
 
 mod mp {
     // IMPROVEMENTS
@@ -11,7 +7,6 @@ mod mp {
     // [ ] Improve performance by managing resources properly
     // [ ] Create a trait
 
-    use faer::col::AsColRef;
     use faer::linalg::matmul::dot::inner_prod;
     use faer::linalg::matmul::matmul;
     use faer::linalg::solvers::SolveLstsq;
@@ -249,23 +244,43 @@ mod mp {
         support: Vec<usize>,
         error_threshold: f64,
         a_ref: &'a Mat<f64>,
-        a_sup: Mat<f64>,
+        // a_sup: Mat<f64>,
         b_ref: &'a Col<f64>,
         stored_inverse: Mat<f64>,
+        as_space: Mat<f64>,
+        inverse_space: Mat<f64>,
+        sweep_x_opt: Col<f64>,
+        sweep_residual: Col<f64>,
+        as_b: Col<f64>,
+        candidate: (usize, f64, Mat<f64>, Col<f64>),
     }
 
     impl<'a> LsOmp<'a> {
         pub fn init(a_ref: &'a Mat<f64>, b_ref: &'a Col<f64>) -> Self {
+            // arbitrary number
+            let error_threshold = 1.0e-8;
+            let nrows = b_ref.nrows();
+            let expected_size = nrows / 5;
+
             let running_solution = Col::zeros(0);
             let residual_error = b_ref.squared_norm_l2();
             let support = Vec::new();
-            // arbitrary number
-            let error_threshold = 1.0e-8;
-            let mut a_sup = Mat::with_capacity(b_ref.nrows(), b_ref.nrows() / 5);
-            unsafe {
-                a_sup.set_dims(b_ref.nrows(), 0);
-            }
             let stored_inverse = Mat::with_capacity(b_ref.nrows() / 5, b_ref.nrows() / 5);
+
+            let mut sweep_x_opt = Col::zeros(0);
+            sweep_x_opt.reserve(expected_size);
+            let sweep_residual = Col::zeros(nrows);
+            let mut as_b = Col::zeros(0);
+            as_b.reserve(expected_size);
+
+            let mut cand_col = Col::zeros(0);
+            cand_col.reserve(expected_size);
+            let candidate = (
+                0,
+                f64::MAX,
+                Mat::with_capacity(expected_size, expected_size),
+                cand_col,
+            );
 
             LsOmp {
                 running_solution: running_solution,
@@ -273,10 +288,26 @@ mod mp {
                 support: support,
                 error_threshold: error_threshold,
                 a_ref: a_ref,
-                a_sup: a_sup,
                 b_ref: b_ref,
                 stored_inverse: stored_inverse,
+                as_space: Mat::with_capacity(nrows, expected_size),
+                inverse_space: Mat::with_capacity(expected_size, expected_size),
+                sweep_x_opt: sweep_x_opt,
+                sweep_residual: sweep_residual,
+                as_b: as_b,
+                candidate: candidate,
             }
+        }
+
+        fn increase_size(&mut self, new_size: usize) {
+            self.as_b.resize_with(new_size, |_| 0.0);
+            self.sweep_x_opt.resize_with(new_size, |_| 0.0);
+            self.inverse_space
+                .resize_with(new_size, new_size, |_, _| 0.0);
+            self.as_space
+                .resize_with(self.sweep_residual.nrows(), new_size, |_, _| 0.0);
+            self.candidate.2.resize_with(new_size, new_size, |_, _| 0.0);
+            self.candidate.3.resize_with(new_size, |_| 0.0);
         }
 
         fn return_reindexed_solution(&self) -> Col<f64> {
@@ -288,11 +319,13 @@ mod mp {
         }
 
         pub fn solve(&mut self) -> Option<Col<f64>> {
+            self.increase_size(1);
             self.scalar_sweep()?;
             if self.residual_error <= self.error_threshold {
                 return Some(self.return_reindexed_solution());
             }
             for i in 1..self.a_ref.ncols() {
+                self.increase_size(i + 1);
                 self.sweep_and_update_running_solution()?;
                 if self.residual_error <= self.error_threshold {
                     return Some(self.return_reindexed_solution());
@@ -302,60 +335,54 @@ mod mp {
         }
 
         fn scalar_sweep(&mut self) -> Option<f64> {
-            let mut cand = (0_usize, f64::MAX, 0_f64, 0_f64);
+            self.candidate.1 = f64::MAX;
+            let mut ai = self.as_space.col_mut(0);
+            let ai_b = self.as_b.get_mut(0);
+            let inv = self.inverse_space.get_mut(0, 0);
+            let z = self.sweep_x_opt.get_mut(0);
             for i in 0..self.a_ref.ncols() {
-                let ai = self.a_ref.col(i);
-                let ai_b = inner_prod(
+                ai.copy_from(self.a_ref.col(i));
+                *ai_b = inner_prod(
                     ai.rb().transpose(),
                     faer::Conj::No,
                     self.b_ref.rb(),
                     faer::Conj::No,
                 );
-                let inv = 1.0 / ai.squared_norm_l2();
-                let z = ai_b / inv;
-                let residual_error = (self.b_ref - z * ai.rb()).squared_norm_l2();
-                if residual_error < cand.1 {
-                    cand = (i, residual_error, inv, z);
+                *inv = 1.0 / ai.squared_norm_l2();
+                *z = *ai_b * *inv;
+                let residual_error = (self.b_ref - *z * ai.rb()).squared_norm_l2();
+                if residual_error < self.candidate.1 {
+                    self.candidate.0 = i;
+                    self.candidate.1 = residual_error;
+                    self.candidate.2[(0, 0)] = *inv;
+                    self.candidate.3[0] = *z;
                 }
             }
-            if cand.1 == f64::MAX {
+            if self.candidate.1 == f64::MAX {
                 return None;
             } else {
-                self.support.push(cand.0);
-                self.residual_error = cand.1;
-                self.stored_inverse.resize_with(1, 1, |_, _| cand.2);
-                self.running_solution.resize_with(1, |_| cand.3);
-                self.a_sup.push_col(self.a_ref.col(cand.0));
-                return Some(cand.1);
+                self.support.push(self.candidate.0);
+                self.residual_error = self.candidate.1;
+                self.stored_inverse
+                    .resize_with(1, 1, |_, _| self.candidate.2[(0, 0)]);
+                self.running_solution
+                    .resize_with(1, |_| self.candidate.3[0]);
+                ai.copy_from(self.a_ref.col(self.candidate.0));
+                *ai_b = inner_prod(
+                    ai.rb().transpose(),
+                    faer::Conj::No,
+                    self.b_ref.rb(),
+                    faer::Conj::No,
+                );
+                // println!("residual error after scalar sweep: {}", cand.1);
+                return Some(self.candidate.1);
             }
         }
 
         fn sweep_and_update_running_solution(&mut self) -> Option<f64> {
-            // we need (A_S^TA_S)-1 & x_S
-            // init running candidate
-            // sweep through unused columns of a_ref
-            // if optimal solution with that column is smaller than previous residual error:
-            // -> update temp_running_solution (not running solution), and already update residual
-            // error
-            //
             let k = self.support.len();
 
-            // (i, residual_error, candidate_inverse, candidate_x)
-            let mut cand = (
-                0_usize,
-                f64::MAX,
-                Mat::zeros(k + 1, k + 1),
-                Col::zeros(k + 1),
-            );
-
-            let mut as_space = Mat::zeros(self.b_ref.nrows(), k + 1);
-            let mut as_block = as_space.submatrix_mut(0, 0, self.b_ref.nrows(), k);
-            as_block.copy_from(self.a_sup.rb());
-            let mut inverse_space = Mat::zeros(k + 1, k + 1);
-            let mut sweep_x_opt = Col::zeros(k + 1);
-            let mut sweep_residual = Col::zeros(self.b_ref.nrows());
-            let mut as_b = self.a_sup.transpose() * self.b_ref;
-            as_b.resize_with(k + 1, |_| 0.0);
+            self.candidate.1 = f64::MAX;
 
             for i in (0..self.a_ref.ncols()).filter(|j| !self.support.contains(j)) {
                 match lstsq_additional_column(
@@ -363,35 +390,52 @@ mod mp {
                     &self.a_ref,
                     &self.b_ref,
                     &self.stored_inverse,
-                    &mut inverse_space,
-                    &mut as_space,
-                    &mut sweep_x_opt,
-                    &mut sweep_residual,
-                    &mut as_b,
+                    &mut self.inverse_space,
+                    &mut self.as_space,
+                    &mut self.sweep_x_opt,
+                    &mut self.sweep_residual,
+                    &mut self.as_b,
                 ) {
                     Some(()) => {
-                        let residual_error = sweep_residual.squared_norm_l2();
+                        let residual_error = self.sweep_residual.squared_norm_l2();
 
-                        if residual_error < cand.1 {
-                            cand.0 = i;
-                            cand.1 = residual_error;
-                            cand.2.copy_from(inverse_space.rb());
-                            cand.3.copy_from(sweep_x_opt.rb());
+                        if residual_error < self.candidate.1 {
+                            self.candidate.0 = i;
+                            self.candidate.1 = residual_error;
+                            self.candidate.2.copy_from(self.inverse_space.rb());
+                            self.candidate.3.copy_from(self.sweep_x_opt.rb());
                         }
                     }
                     None => continue,
                 }
             }
 
-            if cand.1 == f64::MAX {
+            if self.candidate.1 == f64::MAX {
                 return None;
             } else {
-                self.support.push(cand.0);
-                self.residual_error = cand.1;
-                self.stored_inverse = cand.2;
-                self.running_solution = cand.3;
-                self.a_sup.push_col(self.a_ref.col(cand.0));
-                return Some(cand.1);
+                self.support.push(self.candidate.0);
+                self.residual_error = self.candidate.1;
+                self.stored_inverse.resize_with(
+                    self.candidate.2.nrows(),
+                    self.candidate.2.ncols(),
+                    |_, _| 0.0,
+                );
+                self.stored_inverse.copy_from(self.candidate.2.rb());
+                self.running_solution
+                    .resize_with(self.candidate.3.nrows(), |_| 0.0);
+                self.running_solution.copy_from(self.candidate.3.rb());
+                self.as_space
+                    .col_mut(k)
+                    .copy_from(self.a_ref.col(self.candidate.0));
+                matmul(
+                    self.as_b.rb_mut(),
+                    Accum::Replace,
+                    self.as_space.transpose(),
+                    self.b_ref,
+                    1.0,
+                    Par::Seq,
+                );
+                return Some(self.candidate.1);
             }
         }
     }
@@ -478,8 +522,7 @@ mod problem_analysis {
 }
 
 fn main() {
-    let (a, x, b) = problem_analysis::gen_ax_b(50, 200, 20);
-    println!("{:?}", a.shape());
+    let (a, x, b) = problem_analysis::gen_ax_b(100, 500, 50);
 
     println!("OMP:");
     let mut problem = mp::Omp::init(&a, &b);
@@ -497,6 +540,8 @@ fn main() {
         let support_dist = calc_solution_support_dist(&x, &x_cand);
         println!("l2 error: {l2_error:.4e}");
         println!("support dist: {support_dist:.4e}");
+        // println!("x_cand: {x_cand:.2?}");
+        // println!("x: {x:.2?}");
     } else {
         println!("Got None");
     }
