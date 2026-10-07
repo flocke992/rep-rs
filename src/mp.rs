@@ -52,7 +52,7 @@ impl<'a> Omp<'a> {
             running_solution: running_solution,
             running_residual: b_ref.cloned(),
             support: Vec::with_capacity(a_ref.nrows()),
-            error_threshold: 1.0e-8,
+            error_threshold: 1.0e-6,
             a_ref,
             a_sup,
             b_ref,
@@ -279,7 +279,7 @@ impl<'a> LsOmp<'a> {
             "Please normalize columns of a"
         );
         // arbitrary number
-        let error_threshold = 1.0e-8;
+        let error_threshold = 1.0e-6;
         let nrows = b_ref.nrows();
         let expected_size = nrows / 5;
 
@@ -460,7 +460,7 @@ pub struct Mp<'a> {
     support: HashSet<usize>,
     error_threshold: f64,
     a_ref: &'a Mat<f64>,
-    b_ref: &'a Col<f64>,
+    max_iter: usize,
 }
 
 impl<'a> Mp<'a> {
@@ -474,14 +474,15 @@ impl<'a> Mp<'a> {
             running_solution: running_solution,
             running_residual: b_ref.cloned(),
             support: HashSet::with_capacity(a_ref.nrows()),
-            error_threshold: 1.0e-8,
+            error_threshold: 1.0e-6,
             a_ref,
-            b_ref,
+            max_iter: a_ref.ncols() * 5,
         }
     }
 
     fn sweep(&mut self) -> (usize, f64) {
         let mut cand = (0_usize, f64::MAX, 0.0);
+        let residual_error = self.running_residual.squared_norm_l2();
         for i in 0..self.a_ref.ncols() {
             let col_i = self.a_ref.col(i);
             let z_i_opt = inner_prod(
@@ -491,10 +492,8 @@ impl<'a> Mp<'a> {
                 faer::Conj::No,
             );
 
-            let mut res = self.running_residual.squared_norm_l2();
-            res = res - z_i_opt.powi(2);
-            if res < cand.1 {
-                cand = (i, res, z_i_opt);
+            if (residual_error - z_i_opt.powi(2)) < cand.1 {
+                cand = (i, (residual_error - z_i_opt.powi(2)), z_i_opt);
             }
         }
         (cand.0, cand.2)
@@ -518,7 +517,94 @@ impl<'a> Mp<'a> {
         Repeat the process until all columns are visited,
         then we can surely produce b, unless b lies in the null-space of A.
         */
-        for _i in 0..self.a_ref.ncols() * 2 {
+        for _i in 0..self.max_iter {
+            let (j_0, z_j_0) = self.sweep();
+            self.update_support(j_0);
+            self.update_running_solution(j_0, z_j_0);
+            self.update_residual(j_0, z_j_0);
+            if self.running_residual.squared_norm_l2() < self.error_threshold {
+                return Some(self.running_solution.cloned());
+            }
+        }
+        None
+    }
+}
+
+pub struct WeakMp<'a> {
+    weaker_factor: f64,
+    running_solution: Col<f64>,
+    running_residual: Col<f64>,
+    support: HashSet<usize>,
+    error_threshold: f64,
+    a_ref: &'a Mat<f64>,
+    b_ref: &'a Col<f64>,
+    max_iter: usize,
+}
+
+impl<'a> WeakMp<'a> {
+    pub fn init(a_ref: &'a Mat<f64>, b_ref: &'a Col<f64>, weaker_factor: f64) -> Self {
+        assert!(
+            check_normalized_columns(a_ref, 1.0e-15),
+            "Please normalize columns of a"
+        );
+        assert!(
+            (weaker_factor > 0.0) & (weaker_factor < 1.0),
+            "Suboptimal sweep factor must be in range (0,1)"
+        );
+        let running_solution = Col::zeros(a_ref.ncols());
+        WeakMp {
+            weaker_factor: weaker_factor,
+            running_solution: running_solution,
+            running_residual: b_ref.cloned(),
+            support: HashSet::with_capacity(a_ref.nrows()),
+            error_threshold: 1.0e-6,
+            a_ref,
+            b_ref,
+            max_iter: a_ref.ncols() * 5,
+        }
+    }
+
+    fn sweep(&mut self) -> (usize, f64) {
+        let mut cand = (0_usize, f64::MAX, 0.0);
+        let residual_error = self.running_residual.squared_norm_l2();
+        for i in 0..self.a_ref.ncols() {
+            let col_i = self.a_ref.col(i);
+            let z_i_opt = inner_prod(
+                col_i.transpose(),
+                faer::Conj::No,
+                self.running_residual.as_ref(),
+                faer::Conj::No,
+            );
+            if z_i_opt.powi(2) >= self.weaker_factor.powi(2) * residual_error {
+                return (i, z_i_opt);
+            } else if (residual_error - z_i_opt.powi(2)) < cand.1 {
+                cand.0 = i;
+                cand.1 = residual_error - z_i_opt.powi(2);
+                cand.2 = z_i_opt;
+            }
+        }
+        (cand.0, cand.2)
+    }
+
+    fn update_support(&mut self, j_0: usize) {
+        self.support.insert(j_0);
+    }
+
+    fn update_running_solution(&mut self, j_0: usize, z_j_0: f64) {
+        self.running_solution[j_0] += z_j_0;
+    }
+
+    fn update_residual(&mut self, j_0: usize, z_j_0: f64) {
+        zip!(&mut self.running_residual, self.a_ref.col(j_0))
+            .for_each(|unzip!(r, c)| *r = *r - z_j_0 * *c);
+    }
+
+    pub fn solve(&mut self) -> Option<Col<f64>> {
+        /*
+        Repeat the process until all columns are visited,
+        then we can surely produce b, unless b lies in the null-space of A.
+        */
+        for _i in 0..self.max_iter {
             let (j_0, z_j_0) = self.sweep();
             self.update_support(j_0);
             self.update_running_solution(j_0, z_j_0);

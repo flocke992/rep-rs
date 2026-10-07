@@ -87,7 +87,7 @@ mod problem_analysis {
 }
 
 fn main() {
-    let (a, x, b) = problem_analysis::gen_ax_b(30, 50, 10);
+    let (a, x, b) = problem_analysis::gen_ax_b(100, 500, 33);
 
     println!("OMP:");
     let mut problem = mp::Omp::init(&a, &b);
@@ -114,6 +114,19 @@ fn main() {
     println!("MP");
     let mut mp_problem = mp::Mp::init(&a, &b);
     if let Some(x_cand) = mp_problem.solve() {
+        let l2_error = calc_solution_l2_error(&x, &x_cand);
+        let support_dist = calc_solution_support_dist(&x, &x_cand);
+        println!("l2 error: {l2_error:.4e}");
+        println!("support dist: {support_dist:.4e}");
+        // println!("x_cand: {x_cand:.2?}");
+        // println!("x: {x:.2?}");
+    } else {
+        println!("Got None");
+    }
+
+    println!("Weak-MP");
+    let mut weak_mp_problem = mp::WeakMp::init(&a, &b, 0.5);
+    if let Some(x_cand) = weak_mp_problem.solve() {
         let l2_error = calc_solution_l2_error(&x, &x_cand);
         let support_dist = calc_solution_support_dist(&x, &x_cand);
         println!("l2 error: {l2_error:.4e}");
