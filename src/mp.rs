@@ -12,7 +12,7 @@ use faer::{Accum, Col, Mat, Par, unzip, zip};
 
 pub trait Solver {
     fn init() -> Self;
-    // Reserves computational space based on expected number of nonzero coefs.
+    // Reserves computational space based on expected number of nonzero coefficients.
     fn reserve_space(&mut self, expected_n_nonzero_coefs: usize);
     // Solve to approx machine precision.
     fn solve(&mut self) -> Option<Col<f64>>;
@@ -20,6 +20,12 @@ pub trait Solver {
     fn solve_residual_tol(&mut self, residual_tol: f64) -> Option<Col<f64>>;
     // Solve with max number of nonzero coefficients.
     fn solve_n_nonzero_coefs(&mut self, n_nonzero_coefs: usize) -> Option<Col<f64>>;
+}
+
+fn check_normalized_columns(a_ref: &Mat<f64>, tol: f64) -> bool {
+    a_ref
+        .col_iter()
+        .all(|col_i| (col_i.squared_norm_l2() - 1.0) < tol)
 }
 
 pub struct Omp<'a> {
@@ -34,6 +40,10 @@ pub struct Omp<'a> {
 
 impl<'a> Omp<'a> {
     pub fn init(a_ref: &'a Mat<f64>, b_ref: &'a Col<f64>) -> Self {
+        assert!(
+            check_normalized_columns(a_ref, 1.0e-15),
+            "Please normalize columns of a"
+        );
         let running_solution = Col::zeros(a_ref.ncols());
         let a_sup = Mat::zeros(a_ref.nrows(), a_ref.ncols());
         Omp {
@@ -69,7 +79,6 @@ impl<'a> Omp<'a> {
         for i in 0..self.a_ref.ncols() {
             if !self.support.contains(&i) {
                 let col_i = self.a_ref.col(i);
-                let col_normalizer = col_i.squared_norm_l2();
                 let mut res = self.running_residual.squared_norm_l2();
                 res = res
                     - inner_prod(
@@ -78,8 +87,7 @@ impl<'a> Omp<'a> {
                         self.running_residual.as_ref(),
                         faer::Conj::No,
                     )
-                    .powi(2)
-                        / col_normalizer;
+                    .powi(2);
                 if res < cand.1 {
                     cand = (i, res);
                 }
@@ -215,7 +223,7 @@ fn lstsq_additional_column(
         1.0,
         Par::Seq,
     );
-    b4[(0, 0)] = ai.squared_norm_l2();
+    b4[(0, 0)] = 1.0;
     // Fill inverse_space if the bigger matrix is invertible, else return None
     expand_inverse(inverse_space, stored_inverse)?;
 
@@ -264,6 +272,10 @@ pub struct LsOmp<'a> {
 
 impl<'a> LsOmp<'a> {
     pub fn init(a_ref: &'a Mat<f64>, b_ref: &'a Col<f64>) -> Self {
+        assert!(
+            check_normalized_columns(a_ref, 1.0e-15),
+            "Please normalize columns of a"
+        );
         // arbitrary number
         let error_threshold = 1.0e-8;
         let nrows = b_ref.nrows();

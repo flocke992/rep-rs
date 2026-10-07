@@ -55,8 +55,13 @@ mod problem_analysis {
         let start = 1.0;
         let end = 7.0;
 
-        let a = fill_mat_with_normals(nrows, ncols, mean, std);
+        let mut a = fill_mat_with_normals(nrows, ncols, mean, std);
         let x = fill_x_with_uniforms(ncols, start, end, cardinality_bound);
+        //normalize columns
+        a.col_iter_mut().for_each(|col_i| {
+            let scaler = col_i.norm_l2();
+            col_i.iter_mut().for_each(|c_ii| *c_ii /= scaler);
+        });
         let b = &a * &x;
         (a, x, b)
     }
@@ -82,7 +87,7 @@ mod problem_analysis {
 }
 
 fn main() {
-    let (a, x, b) = problem_analysis::gen_ax_b(100, 500, 50);
+    let (a, x, b) = problem_analysis::gen_ax_b(100, 500, 30);
 
     println!("OMP:");
     let mut problem = mp::Omp::init(&a, &b);
