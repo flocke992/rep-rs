@@ -1,8 +1,11 @@
 // IMPROVEMENTS
-// [ ] Implement auto normalization of columns of the matrix A; A_tilde = W@A, where W is diagonal.
+// [x] Implement auto normalization of columns of the matrix A; A_tilde = W@A, where W is diagonal.
 // [ ] Implement other greedy methods (OMP-LS, MP, Weak-MP, Thresholding)
 // [ ] Improve performance by managing resources properly
 // [ ] Create a trait
+// [ ] Provide a config struct in the initialization
+
+use std::collections::HashSet;
 
 use faer::linalg::matmul::dot::inner_prod;
 use faer::linalg::matmul::matmul;
@@ -11,7 +14,6 @@ use faer::reborrow::*;
 use faer::{Accum, Col, Mat, Par, unzip, zip};
 
 pub trait Solver {
-    fn init() -> Self;
     // Reserves computational space based on expected number of nonzero coefficients.
     fn reserve_space(&mut self, expected_n_nonzero_coefs: usize);
     // Solve to approx machine precision.
@@ -449,5 +451,82 @@ impl<'a> LsOmp<'a> {
             );
             return Some(self.candidate.1);
         }
+    }
+}
+
+pub struct Mp<'a> {
+    running_solution: Col<f64>,
+    running_residual: Col<f64>,
+    support: HashSet<usize>,
+    error_threshold: f64,
+    a_ref: &'a Mat<f64>,
+    b_ref: &'a Col<f64>,
+}
+
+impl<'a> Mp<'a> {
+    pub fn init(a_ref: &'a Mat<f64>, b_ref: &'a Col<f64>) -> Self {
+        assert!(
+            check_normalized_columns(a_ref, 1.0e-15),
+            "Please normalize columns of a"
+        );
+        let running_solution = Col::zeros(a_ref.ncols());
+        Mp {
+            running_solution: running_solution,
+            running_residual: b_ref.cloned(),
+            support: HashSet::with_capacity(a_ref.nrows()),
+            error_threshold: 1.0e-8,
+            a_ref,
+            b_ref,
+        }
+    }
+
+    fn sweep(&mut self) -> (usize, f64) {
+        let mut cand = (0_usize, f64::MAX, 0.0);
+        for i in 0..self.a_ref.ncols() {
+            let col_i = self.a_ref.col(i);
+            let z_i_opt = inner_prod(
+                col_i.transpose(),
+                faer::Conj::No,
+                self.running_residual.as_ref(),
+                faer::Conj::No,
+            );
+
+            let mut res = self.running_residual.squared_norm_l2();
+            res = res - z_i_opt.powi(2);
+            if res < cand.1 {
+                cand = (i, res, z_i_opt);
+            }
+        }
+        (cand.0, cand.2)
+    }
+
+    fn update_support(&mut self, j_0: usize) {
+        self.support.insert(j_0);
+    }
+
+    fn update_running_solution(&mut self, j_0: usize, z_j_0: f64) {
+        self.running_solution[j_0] += z_j_0;
+    }
+
+    fn update_residual(&mut self, j_0: usize, z_j_0: f64) {
+        zip!(&mut self.running_residual, self.a_ref.col(j_0))
+            .for_each(|unzip!(r, c)| *r = *r - z_j_0 * *c);
+    }
+
+    pub fn solve(&mut self) -> Option<Col<f64>> {
+        /*
+        Repeat the process until all columns are visited,
+        then we can surely produce b, unless b lies in the null-space of A.
+        */
+        for _i in 0..self.a_ref.ncols() * 2 {
+            let (j_0, z_j_0) = self.sweep();
+            self.update_support(j_0);
+            self.update_running_solution(j_0, z_j_0);
+            self.update_residual(j_0, z_j_0);
+            if self.running_residual.squared_norm_l2() < self.error_threshold {
+                return Some(self.running_solution.cloned());
+            }
+        }
+        None
     }
 }
