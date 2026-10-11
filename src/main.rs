@@ -1,3 +1,4 @@
+use crate::mp::Solver;
 use crate::problem_analysis::{calc_solution_l2_error, calc_solution_support_dist};
 mod mp;
 

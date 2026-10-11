@@ -1,9 +1,13 @@
 // IMPROVEMENTS
 // [x] Implement auto normalization of columns of the matrix A; A_tilde = W@A, where W is diagonal.
-// [ ] Implement other greedy methods (OMP-LS, MP, Weak-MP, Thresholding)
+// [x] Implement other greedy methods (OMP-LS, MP, Weak-MP)
+// [ ] Implement other greedy method (Thresholding)
 // [ ] Improve performance by managing resources properly
-// [ ] Create a trait
+// [x] Create a trait
 // [ ] Provide a config struct in the initialization
+// [x] Have unified error bounds
+// [x] Comment code
+// [ ] Apply Logan Smith "perfect function" video to coding structure
 
 use std::collections::HashSet;
 
@@ -14,14 +18,12 @@ use faer::reborrow::*;
 use faer::{Accum, Col, Mat, Par, unzip, zip};
 
 pub trait Solver {
-    // Reserves computational space based on expected number of nonzero coefficients.
-    fn reserve_space(&mut self, expected_n_nonzero_coefs: usize);
+    // // Reserves computational space based on expected number of nonzero coefficients.
+    // fn reserve_space(&mut self, expected_n_nonzero_coefs: usize);
     // Solve to approx machine precision.
     fn solve(&mut self) -> Option<Col<f64>>;
-    // Solve to user-defined tolerance.
-    fn solve_residual_tol(&mut self, residual_tol: f64) -> Option<Col<f64>>;
     // Solve with max number of nonzero coefficients.
-    fn solve_n_nonzero_coefs(&mut self, n_nonzero_coefs: usize) -> Option<Col<f64>>;
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>>;
 }
 
 fn check_normalized_columns(a_ref: &Mat<f64>, tol: f64) -> bool {
@@ -31,10 +33,14 @@ fn check_normalized_columns(a_ref: &Mat<f64>, tol: f64) -> bool {
 }
 
 pub struct Omp<'a> {
+    // Reserve space for running solution.
     running_solution: Col<f64>,
+    // Reserve space for running residual.
     running_residual: Col<f64>,
+    // Vector to store the indices that have nonzero components.
     support: Vec<usize>,
-    error_threshold: f64,
+    // Threshold to declare that the algorithm is done.
+    sq_error_threshold: f64,
     a_ref: &'a Mat<f64>,
     a_sup: Mat<f64>,
     b_ref: &'a Col<f64>,
@@ -42,66 +48,56 @@ pub struct Omp<'a> {
 
 impl<'a> Omp<'a> {
     pub fn init(a_ref: &'a Mat<f64>, b_ref: &'a Col<f64>) -> Self {
+        // We expect normalized columns.
         assert!(
             check_normalized_columns(a_ref, 1.0e-15),
             "Please normalize columns of a"
         );
-        let running_solution = Col::zeros(a_ref.ncols());
+        // Initialize the algorithm with
+        // running_solution = 0,
+        // running_residual = b,
+        // reserve space that allows that the nullspace of a_sup can be empty.
         let a_sup = Mat::zeros(a_ref.nrows(), a_ref.ncols());
+        let error_threshold = 1.0e-6;
         Omp {
-            running_solution: running_solution,
+            running_solution: Col::zeros(a_ref.ncols()),
             running_residual: b_ref.cloned(),
             support: Vec::with_capacity(a_ref.nrows()),
-            error_threshold: 1.0e-6,
+            sq_error_threshold: error_threshold.powi(2),
             a_ref,
             a_sup,
             b_ref,
         }
     }
 
-    pub fn solve(&mut self) -> Option<Col<f64>> {
-        /*
-        Repeat the process until all columns are visited,
-        then we can surely produce b, unless b lies in the null-space of A.
-        */
-        for _i in 0..self.a_ref.ncols() {
-            let j_0 = self.sweep();
-            self.update_support(j_0);
-            self.update_running_solution();
-            self.update_residual();
-            if self.running_residual.squared_norm_l2() < self.error_threshold {
-                return Some(self.running_solution.cloned());
-            }
-        }
-        None
-    }
-
     fn sweep(&mut self) -> usize {
         let mut cand = (0_usize, f64::MAX);
-        for i in 0..self.a_ref.ncols() {
-            if !self.support.contains(&i) {
-                let col_i = self.a_ref.col(i);
-                let mut res = self.running_residual.squared_norm_l2();
-                res = res
-                    - inner_prod(
-                        col_i.transpose(),
-                        faer::Conj::No,
-                        self.running_residual.as_ref(),
-                        faer::Conj::No,
-                    )
-                    .powi(2);
-                if res < cand.1 {
-                    cand = (i, res);
-                }
+        // Precompute error, it is needed to check the reduced error with the added column a_j.
+        let residual_error = self.running_residual.squared_norm_l2();
+        // search for the unvisited column that reduces the residual error the most.
+        for j in (0..self.a_ref.ncols()).filter(|i| !self.support.contains(i)) {
+            let a_j = self.a_ref.col(j);
+            let z_j_opt = inner_prod(
+                a_j.transpose(),
+                faer::Conj::No,
+                self.running_residual.as_ref(),
+                faer::Conj::No,
+            );
+            // update running candidate if a better column a_j is found.
+            if (residual_error - z_j_opt.powi(2)) < cand.1 {
+                cand = (j, residual_error - z_j_opt.powi(2));
             }
         }
+        // return index of best column j
         cand.0
     }
 
     fn update_support(&mut self, j_0: usize) {
+        // Add column j to the matrix a_sup that reduces the error the most.
         self.a_sup
             .col_mut(self.support.len())
             .copy_from(self.a_ref.col(j_0));
+        // Add index j to the support vec.
         self.support.push(j_0);
     }
 
@@ -109,8 +105,8 @@ impl<'a> Omp<'a> {
         /*
         Solve Lstsq using the submatrix of a_sub that we support until now (using length of
         support).
-        Even though we temporary allocate here this might not be to bad.
-        As we want to find a sparse solution, thus this step should not be called to many times.
+        Even though we temporary allocate here this might not be too bad.
+        We want to find a sparse solution, thus this step should not be called to many times.
         The submatrix only grows by one column for each iteration.
         */
         let qr = self
@@ -124,7 +120,8 @@ impl<'a> Omp<'a> {
     }
 
     fn update_residual(&mut self) {
-        // Computes `1.0 * A @ running_solution` and stores the result in running_residual
+        // Compute running_residual = b - A @ running solution,
+        // this is the updated running_residual
         matmul(
             self.running_residual.rb_mut(),
             Accum::Replace,
@@ -133,8 +130,42 @@ impl<'a> Omp<'a> {
             1.0,
             Par::Seq,
         );
-        // computes `running_residual = b - running_residual`
         zip!(&mut self.running_residual, self.b_ref).for_each(|unzip!(r, b)| *r = b - *r);
+    }
+}
+
+impl<'a> Solver for Omp<'a> {
+    fn solve(&mut self) -> Option<Col<f64>> {
+        /*
+        Repeat the process until at most all columns are visited,
+        then we can surely produce b, unless b lies in the null-space of A then None is returned.
+        */
+        for _i in 0..self.a_ref.ncols() {
+            let j_0 = self.sweep();
+            self.update_support(j_0);
+            self.update_running_solution();
+            self.update_residual();
+            if self.running_residual.squared_norm_l2() < self.sq_error_threshold {
+                return Some(self.running_solution.cloned());
+            }
+        }
+        None
+    }
+
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>> {
+        /*
+        Repeat the process until the running solution reaches the desired cardinality or visited all available columns.
+        */
+        for _i in 0..self.a_ref.ncols().min(support_cardinality) {
+            let j_0 = self.sweep();
+            self.update_support(j_0);
+            self.update_running_solution();
+            self.update_residual();
+            if self.running_residual.squared_norm_l2() < self.sq_error_threshold {
+                return Some(self.running_solution.cloned());
+            }
+        }
+        Some(self.running_solution.cloned())
     }
 }
 
@@ -143,11 +174,11 @@ pub fn expand_inverse(space: &mut Mat<f64>, ref_inv: &Mat<f64>) -> Option<()> {
     We divide the space matrix as follows:
     | b1 b2 |
     | b3 b4 |
+    and expects a reference to M^-1.
     This method calculates:
     | M   b |^-1
     | b^T c |
-    and expects a reference to M^-1.
-    It expects this allocated space to contain at:
+    It expects space to contain:
     | -- b |
     | -- c |
     The dimensions are ref_inf kxk, b kx1, c 1x1
@@ -155,6 +186,7 @@ pub fn expand_inverse(space: &mut Mat<f64>, ref_inv: &Mat<f64>) -> Option<()> {
     */
     let k = ref_inv.nrows();
 
+    // divide space and bind to mutable variables.
     let (mut b1, b2, b3, mut b4) = space.split_at_mut(k, k);
     let (mut b2, mut b3) = (b2.col_mut(0), b3.row_mut(0));
     // First fill b3 with result to reuse
@@ -167,11 +199,12 @@ pub fn expand_inverse(space: &mut Mat<f64>, ref_inv: &Mat<f64>) -> Option<()> {
         Par::Seq,
     );
     let p = 1.0 / (b4[(0, 0)] - inner_prod(b3.rb(), faer::Conj::No, b2.rb(), faer::Conj::No));
+    // inversion can fail here.
     if p.is_infinite() {
         return None;
     }
 
-    // We now have everything we need. Lets start to fill the space.
+    // We now have everything we need. Now fill the space.
     // Fill b4
     b4[(0, 0)] = p;
 
@@ -182,6 +215,7 @@ pub fn expand_inverse(space: &mut Mat<f64>, ref_inv: &Mat<f64>) -> Option<()> {
     // Fill b1
     b1.copy_from(ref_inv);
     matmul(b1.rb_mut(), Accum::Add, b2.rb(), b3.rb(), 1.0 / p, Par::Seq);
+    // Indicate that inversion was successful
     Some(())
 }
 
@@ -197,16 +231,19 @@ fn lstsq_additional_column(
     as_b: &mut Col<f64>,
 ) -> Option<()> {
     /*
-     * inverse_space is free space to write the new inverse to
+     * inverse_space is free space to write the new inverse to.
      * as_space is divided as
      * | as ¦ |, where we can use the last column ¦ to fill it with ai and the rest is
-     * filled with the matrix as, i.e. a_sup
+     * filled with the matrix as, i.e. a_sup.
      */
     let k = stored_inverse.ncols();
+    // Split as_space and bind to mutable variables.
     let (a_s, mut ai) = as_space.split_at_col_mut(k);
+    // Write new new column ai space.
     ai.copy_from(a_ref.col(i).as_mat());
 
-    // adapt as_b for new ai
+    // Adapt as_b for new ai.
+    // We only need b^T@ai, the rest is already calculated.
     as_b[k] = inner_prod(
         ai.rb().col(0).transpose(),
         faer::Conj::No,
@@ -214,8 +251,9 @@ fn lstsq_additional_column(
         faer::Conj::No,
     );
 
-    // Prepare to calculate inverse into inverse_space
+    // Prepare to calculate inverse into inverse_space.
     let (_, mut b2) = inverse_space.split_at_col_mut(k);
+    // Fill b2 & b4 as required by expand_inverse method.
     let (mut b2, mut b4) = b2.rb_mut().split_at_row_mut(k);
     matmul(
         b2.rb_mut(),
@@ -231,9 +269,6 @@ fn lstsq_additional_column(
 
     //Now we want to calculate the lstsq solution, the residual and, then store/return the
     //necessary variables
-
-    // println!("A support: {as_space:.2?}");
-    // println!("b: {b_ref:.2?}");
     matmul(
         sweep_x_opt.rb_mut(),
         Accum::Replace,
@@ -242,7 +277,6 @@ fn lstsq_additional_column(
         1.0,
         Par::Seq,
     );
-    // println!("calculated x opt: {sweep_x_opt:.2?}");
     sweep_residual.copy_from(b_ref);
     matmul(
         sweep_residual.rb_mut(),
@@ -258,7 +292,7 @@ fn lstsq_additional_column(
 pub struct LsOmp<'a> {
     residual_error: f64,
     support: Vec<usize>,
-    error_threshold: f64,
+    sq_error_threshold: f64,
     a_ref: &'a Mat<f64>,
     b_ref: &'a Col<f64>,
     stored_inverse: Mat<f64>,
@@ -279,13 +313,14 @@ impl<'a> LsOmp<'a> {
             "Please normalize columns of a"
         );
         // arbitrary number
-        let error_threshold = 1.0e-6;
+        let error_threshold: f64 = 1.0e-6;
         let nrows = b_ref.nrows();
         let expected_size = nrows / 5;
 
+        // Initialize the problem and allocate space according to the expected_size.
         let residual_error = b_ref.squared_norm_l2();
         let support = Vec::new();
-        let stored_inverse = Mat::with_capacity(b_ref.nrows() / 5, b_ref.nrows() / 5);
+        let stored_inverse = Mat::with_capacity(expected_size, expected_size);
 
         let mut sweep_x_opt = Col::zeros(0);
         sweep_x_opt.reserve(expected_size);
@@ -305,7 +340,7 @@ impl<'a> LsOmp<'a> {
         LsOmp {
             residual_error: residual_error,
             support: support,
-            error_threshold: error_threshold,
+            sq_error_threshold: error_threshold.powi(2),
             a_ref: a_ref,
             b_ref: b_ref,
             stored_inverse: stored_inverse,
@@ -330,6 +365,8 @@ impl<'a> LsOmp<'a> {
     }
 
     fn return_reindexed_solution(&self) -> Col<f64> {
+        // The ordering of the candidate solution doesn't match the ordering of the columns of the
+        // matrix a_ref. This step takes care of the ordering.
         let mut x = Col::zeros(self.a_ref.ncols());
         for (x_i, &j_i) in self.candidate.3.iter().zip(self.support.iter()) {
             x[j_i] = *x_i;
@@ -337,28 +374,15 @@ impl<'a> LsOmp<'a> {
         x
     }
 
-    pub fn solve(&mut self) -> Option<Col<f64>> {
-        self.increase_size(1);
-        self.scalar_sweep()?;
-        if self.residual_error <= self.error_threshold {
-            return Some(self.return_reindexed_solution());
-        }
-        for i in 1..self.a_ref.ncols() {
-            self.increase_size(i + 1);
-            self.sweep_and_update_running_solution()?;
-            if self.residual_error <= self.error_threshold {
-                return Some(self.return_reindexed_solution());
-            }
-        }
-        None
-    }
-
     fn scalar_sweep(&mut self) -> Option<f64> {
+        // Reset residual_error of candidate.
         self.candidate.1 = f64::MAX;
+        // Bind variables.
         let mut ai = self.as_space.col_mut(0);
         let ai_b = self.as_b.get_mut(0);
         let inv = self.inverse_space.get_mut(0, 0);
         let z = self.sweep_x_opt.get_mut(0);
+        // Sweep through columns and update candidate, if the residual error is smaller.
         for i in 0..self.a_ref.ncols() {
             ai.copy_from(self.a_ref.col(i));
             *ai_b = inner_prod(
@@ -378,8 +402,11 @@ impl<'a> LsOmp<'a> {
             }
         }
         if self.candidate.1 == f64::MAX {
+            // No vaild column was found.
             return None;
         } else {
+            // Vaild Column was found. Now update state of Solver to continue with matrix
+            // calculations.
             self.support.push(self.candidate.0);
             self.residual_error = self.candidate.1;
             self.stored_inverse
@@ -399,8 +426,10 @@ impl<'a> LsOmp<'a> {
     fn sweep_and_update_running_solution(&mut self) -> Option<f64> {
         let k = self.support.len();
 
+        // Reset candidate residual error.
         self.candidate.1 = f64::MAX;
 
+        // sweep through remaining columns and keep candidate with lowest residul error.
         for i in (0..self.a_ref.ncols()).filter(|j| !self.support.contains(j)) {
             match lstsq_additional_column(
                 i,
@@ -414,6 +443,8 @@ impl<'a> LsOmp<'a> {
                 &mut self.as_b,
             ) {
                 Some(()) => {
+                    // Inversion was successful, check if residual error is smaller and update
+                    // candidate accordingly.
                     let residual_error = self.sweep_residual.squared_norm_l2();
 
                     if residual_error < self.candidate.1 {
@@ -423,13 +454,18 @@ impl<'a> LsOmp<'a> {
                         self.candidate.3.copy_from(self.sweep_x_opt.rb());
                     }
                 }
+                // Inversion was not successful, continue with other columns.
+                // Todo, do we need something else here?
                 None => continue,
             }
         }
 
         if self.candidate.1 == f64::MAX {
+            // No valid column was found.
             return None;
         } else {
+            // Vaild column was found.
+            // Update state of solver according to candidate.
             self.support.push(self.candidate.0);
             self.residual_error = self.candidate.1;
             self.stored_inverse.resize_with(
@@ -454,11 +490,48 @@ impl<'a> LsOmp<'a> {
     }
 }
 
+impl<'a> Solver for LsOmp<'a> {
+    fn solve(&mut self) -> Option<Col<f64>> {
+        self.increase_size(1);
+        // Scalar sweep, for optimiztion handle this case seperately.
+        self.scalar_sweep()?;
+        if self.residual_error <= self.sq_error_threshold {
+            return Some(self.return_reindexed_solution());
+        }
+        // search until the value falls below the desired residual threshold.
+        for i in 1..self.a_ref.ncols() {
+            self.increase_size(i + 1);
+            self.sweep_and_update_running_solution()?;
+            if self.residual_error <= self.sq_error_threshold {
+                return Some(self.return_reindexed_solution());
+            }
+        }
+        None
+    }
+
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>> {
+        // Same procedure as in but stop as soon as the desired cardinality is reached.
+        self.increase_size(1);
+        self.scalar_sweep()?;
+        if self.residual_error <= self.sq_error_threshold || support_cardinality == 1 {
+            return Some(self.return_reindexed_solution());
+        }
+        for i in 1..self.a_ref.ncols().min(support_cardinality) {
+            self.increase_size(i + 1);
+            self.sweep_and_update_running_solution()?;
+            if self.residual_error <= self.sq_error_threshold {
+                return Some(self.return_reindexed_solution());
+            }
+        }
+        Some(self.return_reindexed_solution())
+    }
+}
+
 pub struct Mp<'a> {
     running_solution: Col<f64>,
     running_residual: Col<f64>,
     support: HashSet<usize>,
-    error_threshold: f64,
+    sq_error_threshold: f64,
     a_ref: &'a Mat<f64>,
     max_iter: usize,
 }
@@ -470,11 +543,12 @@ impl<'a> Mp<'a> {
             "Please normalize columns of a"
         );
         let running_solution = Col::zeros(a_ref.ncols());
+        let error_threshold: f64 = 1.0e-6;
         Mp {
             running_solution: running_solution,
             running_residual: b_ref.cloned(),
             support: HashSet::with_capacity(a_ref.nrows()),
-            error_threshold: 1.0e-6,
+            sq_error_threshold: error_threshold.powi(2),
             a_ref,
             max_iter: a_ref.ncols() * 5,
         }
@@ -511,22 +585,35 @@ impl<'a> Mp<'a> {
         zip!(&mut self.running_residual, self.a_ref.col(j_0))
             .for_each(|unzip!(r, c)| *r = *r - z_j_0 * *c);
     }
+}
 
-    pub fn solve(&mut self) -> Option<Col<f64>> {
-        /*
-        Repeat the process until all columns are visited,
-        then we can surely produce b, unless b lies in the null-space of A.
-        */
+impl<'a> Solver for Mp<'a> {
+    fn solve(&mut self) -> Option<Col<f64>> {
         for _i in 0..self.max_iter {
             let (j_0, z_j_0) = self.sweep();
             self.update_support(j_0);
             self.update_running_solution(j_0, z_j_0);
             self.update_residual(j_0, z_j_0);
-            if self.running_residual.squared_norm_l2() < self.error_threshold {
+            if self.running_residual.squared_norm_l2() < self.sq_error_threshold {
                 return Some(self.running_solution.cloned());
             }
         }
         None
+    }
+
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>> {
+        for _i in 0..self.max_iter {
+            let (j_0, z_j_0) = self.sweep();
+            self.update_support(j_0);
+            self.update_running_solution(j_0, z_j_0);
+            self.update_residual(j_0, z_j_0);
+            if self.running_residual.squared_norm_l2() < self.sq_error_threshold
+                || self.support.len() == support_cardinality
+            {
+                return Some(self.running_solution.cloned());
+            }
+        }
+        Some(self.running_solution.cloned())
     }
 }
 
@@ -535,9 +622,8 @@ pub struct WeakMp<'a> {
     running_solution: Col<f64>,
     running_residual: Col<f64>,
     support: HashSet<usize>,
-    error_threshold: f64,
+    sq_error_threshold: f64,
     a_ref: &'a Mat<f64>,
-    b_ref: &'a Col<f64>,
     max_iter: usize,
 }
 
@@ -552,14 +638,14 @@ impl<'a> WeakMp<'a> {
             "Suboptimal sweep factor must be in range (0,1)"
         );
         let running_solution = Col::zeros(a_ref.ncols());
+        let error_threshold: f64 = 1.0e-6;
         WeakMp {
             weaker_factor: weaker_factor,
             running_solution: running_solution,
             running_residual: b_ref.cloned(),
             support: HashSet::with_capacity(a_ref.nrows()),
-            error_threshold: 1.0e-6,
+            sq_error_threshold: error_threshold.powi(2),
             a_ref,
-            b_ref,
             max_iter: a_ref.ncols() * 5,
         }
     }
@@ -567,6 +653,7 @@ impl<'a> WeakMp<'a> {
     fn sweep(&mut self) -> (usize, f64) {
         let mut cand = (0_usize, f64::MAX, 0.0);
         let residual_error = self.running_residual.squared_norm_l2();
+        // stop searching if residual_error is below residual_error * weaker_factor.
         for i in 0..self.a_ref.ncols() {
             let col_i = self.a_ref.col(i);
             let z_i_opt = inner_prod(
@@ -598,21 +685,34 @@ impl<'a> WeakMp<'a> {
         zip!(&mut self.running_residual, self.a_ref.col(j_0))
             .for_each(|unzip!(r, c)| *r = *r - z_j_0 * *c);
     }
+}
 
-    pub fn solve(&mut self) -> Option<Col<f64>> {
-        /*
-        Repeat the process until all columns are visited,
-        then we can surely produce b, unless b lies in the null-space of A.
-        */
+impl<'a> Solver for WeakMp<'a> {
+    fn solve(&mut self) -> Option<Col<f64>> {
         for _i in 0..self.max_iter {
             let (j_0, z_j_0) = self.sweep();
             self.update_support(j_0);
             self.update_running_solution(j_0, z_j_0);
             self.update_residual(j_0, z_j_0);
-            if self.running_residual.squared_norm_l2() < self.error_threshold {
+            if self.running_residual.squared_norm_l2() < self.sq_error_threshold {
                 return Some(self.running_solution.cloned());
             }
         }
         None
+    }
+
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>> {
+        for _i in 0..self.max_iter {
+            let (j_0, z_j_0) = self.sweep();
+            self.update_support(j_0);
+            self.update_running_solution(j_0, z_j_0);
+            self.update_residual(j_0, z_j_0);
+            if self.running_residual.squared_norm_l2() < self.sq_error_threshold
+                || self.support.len() == support_cardinality
+            {
+                return Some(self.running_solution.cloned());
+            }
+        }
+        Some(self.running_solution.cloned())
     }
 }
