@@ -1,2 +1,5 @@
 /target
 .harper-dictionary.txt
+.venv
+*.csv
+*.ipynb

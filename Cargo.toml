@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+csv = "1.4.0"
 faer = "0.24.4"
 rand = "0.10.3"
 rand_distr = "0.6.0"
