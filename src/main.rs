@@ -7,7 +7,7 @@ mod mp;
 fn main() {
     inspection::experiments::repeated_random_comparisons(
         "30_50_exact.csv",
-        100,
+        500,
         30,
         50,
         &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
@@ -15,7 +15,7 @@ fn main() {
     .expect("got an csv error");
     inspection::experiments::repeated_random_comparisons(
         "60_100_exact.csv",
-        100,
+        500,
         60,
         100,
         &[5, 7, 9, 11, 13, 15, 17, 19, 21],
