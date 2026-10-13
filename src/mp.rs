@@ -17,7 +17,21 @@ use faer::linalg::solvers::SolveLstsq;
 use faer::reborrow::*;
 use faer::{Accum, Col, Mat, Par, unzip, zip};
 
-pub struct ProblemConfig<'a> {
+pub trait Solver<'a> {
+    // Solve to approx machine precision.
+    fn solve(&mut self) -> Option<Col<f64>>;
+    // Solve with max number of nonzero coefficients.
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>>;
+    fn solver_type_name(&self) -> String;
+}
+
+pub trait SolverConfig {}
+
+pub trait Initializable<'a, C: SolverConfig>: Solver<'a> + Sized {
+    fn init(config: &'a C) -> Self;
+}
+
+pub struct BaseConfig<'a> {
     a_ref: &'a Mat<f64>,
     b_ref: &'a Col<f64>,
     // Threshold to declare that the algorithm is done.
@@ -26,7 +40,9 @@ pub struct ProblemConfig<'a> {
     expected_size: usize,
 }
 
-impl<'a> ProblemConfig<'a> {
+impl<'a> SolverConfig for BaseConfig<'a> {}
+
+impl<'a> BaseConfig<'a> {
     pub fn init(
         a_ref: &'a Mat<f64>,
         b_ref: &'a Col<f64>,
@@ -37,7 +53,7 @@ impl<'a> ProblemConfig<'a> {
             check_normalized_columns(a_ref, 1.0e-15),
             "Please normalize columns of a"
         );
-        ProblemConfig {
+        BaseConfig {
             a_ref,
             b_ref,
             sq_error_threshold: error_treshold.powi(2),
@@ -46,12 +62,50 @@ impl<'a> ProblemConfig<'a> {
     }
 }
 
-pub trait Solver<'a> {
-    fn init(config: &'a ProblemConfig) -> Self;
-    // Solve to approx machine precision.
-    fn solve(&mut self) -> Option<Col<f64>>;
-    // Solve with max number of nonzero coefficients.
-    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>>;
+pub struct WeakMpConfig<'a> {
+    a_ref: &'a Mat<f64>,
+    b_ref: &'a Col<f64>,
+    // Threshold to declare that the algorithm is done.
+    sq_error_threshold: f64,
+    // Expected cardinality of solution. Used for pre-allocations.
+    expected_size: usize,
+    weaker_factor: f64,
+}
+
+impl<'a> SolverConfig for WeakMpConfig<'a> {}
+
+impl<'a> WeakMpConfig<'a> {
+    pub fn init(
+        a_ref: &'a Mat<f64>,
+        b_ref: &'a Col<f64>,
+        error_treshold: f64,
+        expected_size: usize,
+        weaker_factor: f64,
+    ) -> Self {
+        assert!(
+            check_normalized_columns(a_ref, 1.0e-15),
+            "Please normalize columns of a"
+        );
+        assert!(
+            0.0 < weaker_factor && 1.0 > weaker_factor,
+            "weaker factor must be an element of (0,1)"
+        );
+        WeakMpConfig {
+            a_ref,
+            b_ref,
+            sq_error_threshold: error_treshold.powi(2),
+            expected_size,
+            weaker_factor,
+        }
+    }
+}
+
+pub fn init_solver<'a, S, C>(config: &'a C) -> S
+where
+    C: SolverConfig,
+    S: Initializable<'a, C>,
+{
+    S::init(config)
 }
 
 fn check_normalized_columns(a_ref: &Mat<f64>, tol: f64) -> bool {
@@ -68,7 +122,7 @@ pub struct Omp<'a> {
     // Vector to store the indices that have nonzero components.
     support: Vec<usize>,
     a_sup: Mat<f64>,
-    config: &'a ProblemConfig<'a>,
+    config: &'a BaseConfig<'a>,
 }
 
 impl<'a> Omp<'a> {
@@ -131,8 +185,8 @@ impl<'a> Omp<'a> {
     }
 }
 
-impl<'a> Solver<'a> for Omp<'a> {
-    fn init(config: &'a ProblemConfig) -> Self {
+impl<'a> Initializable<'a, BaseConfig<'a>> for Omp<'a> {
+    fn init(config: &'a BaseConfig) -> Self {
         // reserve space that allows that the nullspace of a_sup can be empty.
         let mut a_sup = Mat::with_capacity(config.a_ref.nrows(), config.expected_size);
         unsafe {
@@ -146,6 +200,9 @@ impl<'a> Solver<'a> for Omp<'a> {
             config,
         }
     }
+}
+
+impl<'a> Solver<'a> for Omp<'a> {
     fn solve(&mut self) -> Option<Col<f64>> {
         /*
         Repeat the process until at most all columns are visited,
@@ -177,6 +234,10 @@ impl<'a> Solver<'a> for Omp<'a> {
             }
         }
         Some(self.running_solution.cloned())
+    }
+
+    fn solver_type_name(&self) -> String {
+        "omp".to_string()
     }
 }
 
@@ -312,7 +373,7 @@ pub struct LsOmp<'a> {
     // Candidate is organized as:
     // (index, residual error, candidate inverse, candidate solution)
     candidate: (usize, f64, Mat<f64>, Col<f64>),
-    config: &'a ProblemConfig<'a>,
+    config: &'a BaseConfig<'a>,
 }
 
 impl<'a> LsOmp<'a> {
@@ -453,8 +514,8 @@ impl<'a> LsOmp<'a> {
     }
 }
 
-impl<'a> Solver<'a> for LsOmp<'a> {
-    fn init(config: &'a ProblemConfig) -> Self {
+impl<'a> Initializable<'a, BaseConfig<'a>> for LsOmp<'a> {
+    fn init(config: &'a BaseConfig<'a>) -> Self {
         // Initialize the problem and allocate space according to the expected_size.
         let residual_error = config.b_ref.squared_norm_l2();
         let support = Vec::new();
@@ -488,7 +549,9 @@ impl<'a> Solver<'a> for LsOmp<'a> {
             candidate: candidate,
         }
     }
+}
 
+impl<'a> Solver<'a> for LsOmp<'a> {
     fn solve(&mut self) -> Option<Col<f64>> {
         self.increase_size(1);
         // Scalar sweep, for optimiztion handle this case seperately.
@@ -523,6 +586,10 @@ impl<'a> Solver<'a> for LsOmp<'a> {
         }
         Some(self.return_reindexed_solution())
     }
+
+    fn solver_type_name(&self) -> String {
+        "ls-omp".to_string()
+    }
 }
 
 pub struct Mp<'a> {
@@ -530,7 +597,7 @@ pub struct Mp<'a> {
     running_residual: Col<f64>,
     support: HashSet<usize>,
     max_iter: usize,
-    config: &'a ProblemConfig<'a>,
+    config: &'a BaseConfig<'a>,
 }
 
 impl<'a> Mp<'a> {
@@ -570,8 +637,8 @@ impl<'a> Mp<'a> {
     }
 }
 
-impl<'a> Solver<'a> for Mp<'a> {
-    fn init(config: &'a ProblemConfig) -> Self {
+impl<'a> Initializable<'a, BaseConfig<'a>> for Mp<'a> {
+    fn init(config: &'a BaseConfig<'a>) -> Self {
         let running_solution = Col::zeros(config.a_ref.ncols());
         Mp {
             running_solution: running_solution,
@@ -581,7 +648,9 @@ impl<'a> Solver<'a> for Mp<'a> {
             config: config,
         }
     }
+}
 
+impl<'a> Solver<'a> for Mp<'a> {
     fn solve(&mut self) -> Option<Col<f64>> {
         for _i in 0..self.max_iter {
             let (j_0, z_j_0) = self.sweep();
@@ -609,15 +678,18 @@ impl<'a> Solver<'a> for Mp<'a> {
         }
         Some(self.running_solution.cloned())
     }
+
+    fn solver_type_name(&self) -> String {
+        "mp".to_string()
+    }
 }
 
 pub struct WeakMp<'a> {
-    weaker_factor: f64,
     running_solution: Col<f64>,
     running_residual: Col<f64>,
     support: HashSet<usize>,
     max_iter: usize,
-    config: &'a ProblemConfig<'a>,
+    config: &'a WeakMpConfig<'a>,
 }
 
 impl<'a> WeakMp<'a> {
@@ -633,7 +705,7 @@ impl<'a> WeakMp<'a> {
                 self.running_residual.as_ref(),
                 faer::Conj::No,
             );
-            if z_i_opt.powi(2) >= self.weaker_factor.powi(2) * residual_error {
+            if z_i_opt.powi(2) >= self.config.weaker_factor.powi(2) * residual_error {
                 return (i, z_i_opt);
             } else if (residual_error - z_i_opt.powi(2)) < cand.1 {
                 cand.0 = i;
@@ -658,16 +730,14 @@ impl<'a> WeakMp<'a> {
     }
 }
 
-impl<'a> Solver<'a> for WeakMp<'a> {
-    fn init(config: &'a ProblemConfig) -> Self {
-        let weaker_factor = 0.5; // maybe add this to a config.
+impl<'a> Initializable<'a, WeakMpConfig<'a>> for WeakMp<'a> {
+    fn init(config: &'a WeakMpConfig<'a>) -> Self {
         assert!(
-            (weaker_factor > 0.0) & (weaker_factor < 1.0),
+            (config.weaker_factor > 0.0) & (config.weaker_factor < 1.0),
             "Suboptimal sweep factor must be in range (0,1)"
         );
         let running_solution = Col::zeros(config.a_ref.ncols());
         WeakMp {
-            weaker_factor: weaker_factor,
             running_solution: running_solution,
             running_residual: config.b_ref.cloned(),
             support: HashSet::with_capacity(config.expected_size),
@@ -675,7 +745,9 @@ impl<'a> Solver<'a> for WeakMp<'a> {
             config,
         }
     }
+}
 
+impl<'a> Solver<'a> for WeakMp<'a> {
     fn solve(&mut self) -> Option<Col<f64>> {
         for _i in 0..self.max_iter {
             let (j_0, z_j_0) = self.sweep();
@@ -702,5 +774,9 @@ impl<'a> Solver<'a> for WeakMp<'a> {
             }
         }
         Some(self.running_solution.cloned())
+    }
+
+    fn solver_type_name(&self) -> String {
+        "weak-mp".to_string()
     }
 }
