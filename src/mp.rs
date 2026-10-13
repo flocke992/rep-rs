@@ -780,3 +780,110 @@ impl<'a> Solver<'a> for WeakMp<'a> {
         "weak-mp".to_string()
     }
 }
+
+pub struct Thresholding<'a> {
+    config: &'a BaseConfig<'a>,
+    inner_products: Col<f64>,
+    a_sup: Mat<f64>,
+}
+
+impl<'a> Thresholding<'a> {
+    fn compute_inner_products(&mut self) {
+        matmul(
+            self.inner_products.rb_mut(),
+            Accum::Replace,
+            self.config.a_ref.transpose(),
+            self.config.b_ref,
+            1.0,
+            Par::Seq,
+        );
+    }
+
+    fn sort_indicies(&self) -> Vec<usize> {
+        let mut indicies: Vec<usize> = (0..self.inner_products.nrows()).collect();
+        indicies.sort_by(|&i, &j| {
+            self.inner_products[j]
+                .abs()
+                .total_cmp(&self.inner_products[i].abs())
+        });
+        indicies
+    }
+
+    fn solve_lstsq_a_sup(&self) -> Col<f64> {
+        let qr = self.a_sup.col_piv_qr();
+        qr.solve_lstsq(self.config.b_ref)
+    }
+
+    fn reindex_solution(&self, indicies: &[usize], x: &Col<f64>) -> Col<f64> {
+        let mut running_solution = Col::zeros(self.config.a_ref.ncols());
+        for (x_i, &j_i) in x.iter().zip(indicies.iter()) {
+            running_solution[j_i] = *x_i;
+        }
+        running_solution
+    }
+}
+
+impl<'a> Solver<'a> for Thresholding<'a> {
+    fn solve(&mut self) -> Option<Col<f64>> {
+        let mut running_residual = Col::zeros(self.config.b_ref.nrows());
+        self.compute_inner_products();
+        let support_indicies = self.sort_indicies();
+        for &idx in support_indicies.iter() {
+            self.a_sup.push_col(self.config.a_ref.col(idx));
+            let x = self.solve_lstsq_a_sup();
+
+            running_residual.copy_from(self.config.b_ref);
+            //update running_residual
+            matmul(
+                running_residual.rb_mut(),
+                Accum::Add,
+                self.a_sup.rb(),
+                x.rb(),
+                -1.0,
+                Par::Seq,
+            );
+
+            if running_residual.squared_norm_l2() < self.config.sq_error_threshold {
+                return Some(self.reindex_solution(&support_indicies, &x));
+            }
+        }
+        todo!("impl solve")
+    }
+
+    fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>> {
+        //resize a_sup to n_nonzero coefs.
+        self.a_sup
+            .reserve(self.config.a_ref.nrows(), support_cardinality);
+
+        self.compute_inner_products();
+        let support_indicies = self.sort_indicies();
+        // fill a_sup with columns in question
+        support_indicies
+            .iter()
+            .take(support_cardinality)
+            .for_each(|&idx| self.a_sup.push_col(self.config.a_ref.col(idx)));
+
+        let x = self.solve_lstsq_a_sup();
+        Some(self.reindex_solution(&support_indicies, &x))
+    }
+
+    fn solver_type_name(&self) -> String {
+        "thresholding".to_string()
+    }
+}
+
+impl<'a> Initializable<'a, BaseConfig<'a>> for Thresholding<'a> {
+    fn init(config: &'a BaseConfig<'a>) -> Self {
+        let inner_products = Col::zeros(config.a_ref.ncols());
+        // reserve space that allows that the nullspace of a_sup can be empty.
+        let mut a_sup = Mat::with_capacity(config.a_ref.nrows(), config.expected_size);
+        unsafe {
+            a_sup.set_dims(config.a_ref.nrows(), 0);
+        }
+        Thresholding {
+            config,
+            inner_products,
+            a_sup,
+        }
+    }
+}
