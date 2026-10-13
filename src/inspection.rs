@@ -144,13 +144,16 @@ pub mod experiments {
     use crate::inspection::{
         calc_solution_l2_error, calc_solution_support_dist, gen_ax_b, gen_ax_b_exact,
     };
-    use crate::mp::{LsOmp, Mp, Omp, Solver, WeakMp};
+    use crate::mp::{LsOmp, Mp, Omp, ProblemConfig, Solver, WeakMp};
     use csv::Writer;
     use std::error::Error;
     use std::hint::black_box;
     use std::time::Instant;
 
-    fn measure_time_solve<S: Solver>(s: &mut S) -> Option<(f64, Col<f64>)> {
+    fn measure_time_solve<'a, S>(s: &mut S) -> Option<(f64, Col<f64>)>
+    where
+        S: Solver<'a>,
+    {
         let start = Instant::now();
         let res = black_box(s.solve());
         let elapsed = start.elapsed();
@@ -177,8 +180,9 @@ pub mod experiments {
         for &solution_cardinality in solution_caridnalities {
             for i in 0..nrepeats {
                 let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
+                let config = ProblemConfig::init(&a, &b, 1.0e-6, b.nrows() / 5);
 
-                let mut omp = Omp::init(black_box(&a), black_box(&b));
+                let mut omp = Omp::init(black_box(&config));
                 let res = measure_time_solve(&mut omp);
                 match res {
                     Some((time, x_opt)) => {
@@ -199,7 +203,7 @@ pub mod experiments {
                     }
                 }
 
-                let mut ls_omp = LsOmp::init(black_box(&a), black_box(&b));
+                let mut ls_omp = LsOmp::init(black_box(&config));
                 let res = measure_time_solve(&mut ls_omp);
                 match res {
                     Some((time, x_opt)) => {
@@ -220,7 +224,7 @@ pub mod experiments {
                     }
                 }
 
-                let mut mp = Mp::init(black_box(&a), black_box(&b));
+                let mut mp = Mp::init(black_box(&config));
                 let res = measure_time_solve(&mut mp);
                 match res {
                     Some((time, x_opt)) => {
@@ -241,7 +245,7 @@ pub mod experiments {
                     }
                 }
 
-                let mut weak_mp = WeakMp::init(black_box(&a), black_box(&b));
+                let mut weak_mp = WeakMp::init(black_box(&config));
                 let res = measure_time_solve(&mut weak_mp);
                 match res {
                     Some((time, x_opt)) => {
