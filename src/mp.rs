@@ -2,7 +2,7 @@
 // [x] Implement auto normalization of columns of the matrix A; A_tilde = W@A, where W is diagonal.
 // [x] Implement other greedy methods (OMP-LS, MP, Weak-MP)
 // [ ] Implement other greedy method (Thresholding)
-// [ ] Improve performance by managing resources properly of OMP
+// [x] Improve performance by managing resources properly of OMP
 // [x] Create a trait
 // [x] Provide a config struct in the initialization
 // [x] Have unified error bounds
@@ -11,9 +11,12 @@
 
 use std::collections::HashSet;
 
+use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::matmul::dot::inner_prod;
 use faer::linalg::matmul::matmul;
+use faer::linalg::qr::no_pivoting::factor;
 use faer::linalg::solvers::SolveLstsq;
+use faer::linalg::{householder, qr, triangular_solve};
 use faer::reborrow::*;
 use faer::{Accum, Col, Mat, Par, unzip, zip};
 
@@ -114,6 +117,64 @@ fn check_normalized_columns(a_ref: &Mat<f64>, tol: f64) -> bool {
         .all(|col_i| (col_i.squared_norm_l2() - 1.0) < tol)
 }
 
+fn allocate_buffer(req: StackReq) -> MemBuffer {
+    MemBuffer::new(req)
+}
+
+fn calculate_h_factor_req(nrows: usize, ncols: usize) -> (usize, usize) {
+    // returns (rank, block_size)
+    let rank = Ord::min(nrows, ncols);
+    let block_size = factor::recommended_block_size::<f64>(nrows, ncols);
+    (rank, block_size)
+}
+
+fn calculate_stack_req(nrows: usize, ncols: usize) -> StackReq {
+    let block_size = factor::recommended_block_size::<f64>(nrows, ncols);
+    StackReq::any_of(&[
+        factor::qr_in_place_scratch::<f64>(nrows, ncols, block_size, Par::Seq, Default::default()),
+        householder::apply_block_householder_transpose_on_the_left_in_place_scratch::<f64>(
+            nrows, block_size, ncols,
+        ),
+    ])
+}
+
+fn solve_qr_inplace(
+    a: &mut Mat<f64>,
+    h_factor: &mut Mat<f64>,
+    b: &Col<f64>,
+    x: &mut Col<f64>,
+    buf: &mut MemBuffer,
+) {
+    // writes newly solved lsq in x_cand
+    let rank = Ord::min(a.nrows(), a.ncols());
+    // this is not a costly operation. Just reinterpret the provided buffer as a stack.
+    let mut stack = MemStack::new(buf);
+    // I don't think we need to set the h_factors, they will be overwritten.
+    factor::qr_in_place(
+        a.as_mut(),
+        h_factor.as_mut(),
+        Par::Seq,
+        stack.rb_mut(),
+        Default::default(),
+    );
+    // how big does the solution mat need to be?
+    x.copy_from(b);
+    householder::apply_block_householder_sequence_transpose_on_the_left_in_place_with_conj(
+        a.as_ref(),
+        h_factor.as_ref(),
+        faer::Conj::Yes,
+        x.as_mat_mut(),
+        Par::Seq,
+        stack.rb_mut(),
+    );
+    x.truncate(rank);
+    triangular_solve::solve_upper_triangular_in_place(
+        a.as_ref().split_at_row(rank).0,
+        x.as_mat_mut(),
+        Par::Seq,
+    );
+}
+
 pub struct Omp<'a> {
     // Reserve space for running solution.
     running_solution: Col<f64>,
@@ -123,6 +184,14 @@ pub struct Omp<'a> {
     support: Vec<usize>,
     a_sup: Mat<f64>,
     config: &'a BaseConfig<'a>,
+    // Buffer requirements to trigger reallocation if needed
+    allocated_buf_req: StackReq,
+    h_factor: Mat<f64>,
+    // Space to write QR decomposition in.
+    // Reuse over iterations.
+    qr_mat: Mat<f64>,
+    // Allocated memory for efficient qr solve
+    buf: MemBuffer,
 }
 
 impl<'a> Omp<'a> {
@@ -148,6 +217,20 @@ impl<'a> Omp<'a> {
         cand.0
     }
 
+    fn increase_allocated_memory(&mut self) {
+        // increases memory according to self.a_sup
+        let (nrows, ncols) = (self.a_sup.nrows(), self.a_sup.ncols());
+        let (rank, block_size) = calculate_h_factor_req(nrows, ncols);
+        self.h_factor.resize_with(block_size, rank, |_, _| 0.0);
+        self.qr_mat.resize_with(nrows, ncols, |_, _| 0.0);
+        self.running_solution
+            .resize_with(self.config.b_ref.nrows(), |_| 0.0);
+        let new_req = calculate_stack_req(nrows, ncols);
+        if new_req.size_bytes() > self.allocated_buf_req.size_bytes() {
+            self.buf = allocate_buffer(calculate_stack_req(nrows, (ncols - 1) * 2));
+        }
+    }
+
     fn update_support(&mut self, j_0: usize) {
         // Add column j to the matrix a_sup that reduces the error the most.
         self.a_sup.push_col(self.config.a_ref.col(j_0));
@@ -157,17 +240,30 @@ impl<'a> Omp<'a> {
 
     fn update_running_solution(&mut self) {
         /*
-        Solve Lstsq using the submatrix of a_sub that we support until now (using length of
-        support).
-        Even though we temporary allocate here this might not be too bad.
+        Solve Lstsq using a_sub and b.
         We want to find a sparse solution, thus this step should not be called to many times.
-        The submatrix only grows by one column for each iteration.
         */
-        let qr = self.a_sup.col_piv_qr();
-        let x = qr.solve_lstsq(self.config.b_ref);
-        for (x_i, &j_i) in x.iter().zip(self.support.iter()) {
-            self.running_solution[j_i] = *x_i;
+        self.qr_mat.copy_from(self.a_sup.rb());
+        solve_qr_inplace(
+            &mut self.qr_mat,
+            &mut self.h_factor,
+            self.config.b_ref,
+            &mut self.running_solution,
+            &mut self.buf,
+        );
+        // self.solve_qr();
+    }
+
+    fn return_reindex_solution(&self) -> Col<f64> {
+        /*
+         * reindex and write correct coefficients in vector that fits dimensions of the full matrix
+         * A.
+         */
+        let mut res = Col::zeros(self.config.a_ref.ncols());
+        for (x_i, &j_i) in self.running_solution.iter().zip(self.support.iter()) {
+            res[j_i] = *x_i;
         }
+        res
     }
 
     fn update_residual(&mut self) {
@@ -176,7 +272,7 @@ impl<'a> Omp<'a> {
         matmul(
             self.running_residual.rb_mut(),
             Accum::Replace,
-            self.config.a_ref,
+            self.a_sup.rb(),
             self.running_solution.rb(),
             1.0,
             Par::Seq,
@@ -192,12 +288,22 @@ impl<'a> Initializable<'a, BaseConfig<'a>> for Omp<'a> {
         unsafe {
             a_sup.set_dims(config.a_ref.nrows(), 0);
         }
+        let req = calculate_stack_req(config.a_ref.nrows(), config.expected_size);
+        let (rank, block_size) = calculate_h_factor_req(config.a_ref.nrows(), config.expected_size);
+        let buf = allocate_buffer(req);
+        let h_factor = Mat::with_capacity(block_size, rank);
+        let qr_mat = Mat::with_capacity(config.a_ref.nrows(), config.expected_size);
+        let x_cand = Col::zeros(config.b_ref.nrows());
         Omp {
-            running_solution: Col::zeros(config.a_ref.ncols()),
             running_residual: config.b_ref.cloned(),
             support: Vec::with_capacity(config.a_ref.nrows()),
             a_sup,
             config,
+            allocated_buf_req: req,
+            h_factor: h_factor,
+            qr_mat: qr_mat,
+            buf: buf,
+            running_solution: x_cand,
         }
     }
 }
@@ -211,10 +317,11 @@ impl<'a> Solver<'a> for Omp<'a> {
         for _i in 0..self.config.a_ref.ncols() {
             let j_0 = self.sweep();
             self.update_support(j_0);
+            self.increase_allocated_memory();
             self.update_running_solution();
             self.update_residual();
             if self.running_residual.squared_norm_l2() < self.config.sq_error_threshold {
-                return Some(self.running_solution.cloned());
+                return Some(self.return_reindex_solution());
             }
         }
         None
@@ -227,13 +334,14 @@ impl<'a> Solver<'a> for Omp<'a> {
         for _i in 0..self.config.a_ref.ncols().min(support_cardinality) {
             let j_0 = self.sweep();
             self.update_support(j_0);
+            self.increase_allocated_memory();
             self.update_running_solution();
             self.update_residual();
             if self.running_residual.squared_norm_l2() < self.config.sq_error_threshold {
-                return Some(self.running_solution.cloned());
+                return Some(self.return_reindex_solution());
             }
         }
-        Some(self.running_solution.cloned())
+        Some(self.return_reindex_solution())
     }
 
     fn solver_type_name(&self) -> String {
