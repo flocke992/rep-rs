@@ -15,8 +15,7 @@ use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::matmul::dot::inner_prod;
 use faer::linalg::matmul::matmul;
 use faer::linalg::qr::no_pivoting::factor;
-use faer::linalg::solvers::SolveLstsq;
-use faer::linalg::{householder, qr, triangular_solve};
+use faer::linalg::{householder, triangular_solve};
 use faer::reborrow::*;
 use faer::{Accum, Col, Mat, Par, unzip, zip};
 
@@ -25,7 +24,7 @@ pub trait Solver<'a> {
     fn solve(&mut self) -> Option<Col<f64>>;
     // Solve with max number of nonzero coefficients.
     fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>>;
-    fn solver_type_name(&self) -> String;
+    fn name(&self) -> String;
 }
 
 pub trait SolverConfig {}
@@ -267,17 +266,27 @@ impl<'a> Omp<'a> {
     }
 
     fn update_residual(&mut self) {
-        // Compute running_residual = b - A @ running solution,
+        // Compute running_residual = b - A @ running_solution,
         // this is the updated running_residual
+        self.running_residual.copy_from(self.config.b_ref);
         matmul(
             self.running_residual.rb_mut(),
-            Accum::Replace,
+            Accum::Add,
             self.a_sup.rb(),
             self.running_solution.rb(),
-            1.0,
+            -1.0,
             Par::Seq,
         );
-        zip!(&mut self.running_residual, self.config.b_ref).for_each(|unzip!(r, b)| *r = b - *r);
+
+        // matmul(
+        //     self.running_residual.rb_mut(),
+        //     Accum::Replace,
+        //     self.a_sup.rb(),
+        //     self.running_solution.rb(),
+        //     1.0,
+        //     Par::Seq,
+        // );
+        // zip!(&mut self.running_residual, self.config.b_ref).for_each(|unzip!(r, b)| *r = b - *r);
     }
 }
 
@@ -293,7 +302,7 @@ impl<'a> Initializable<'a, BaseConfig<'a>> for Omp<'a> {
         let buf = allocate_buffer(req);
         let h_factor = Mat::with_capacity(block_size, rank);
         let qr_mat = Mat::with_capacity(config.a_ref.nrows(), config.expected_size);
-        let x_cand = Col::zeros(config.b_ref.nrows());
+        let running_solution = Col::zeros(config.b_ref.nrows());
         Omp {
             running_residual: config.b_ref.cloned(),
             support: Vec::with_capacity(config.a_ref.nrows()),
@@ -303,7 +312,7 @@ impl<'a> Initializable<'a, BaseConfig<'a>> for Omp<'a> {
             h_factor: h_factor,
             qr_mat: qr_mat,
             buf: buf,
-            running_solution: x_cand,
+            running_solution,
         }
     }
 }
@@ -344,7 +353,7 @@ impl<'a> Solver<'a> for Omp<'a> {
         Some(self.return_reindex_solution())
     }
 
-    fn solver_type_name(&self) -> String {
+    fn name(&self) -> String {
         "omp".to_string()
     }
 }
@@ -695,7 +704,7 @@ impl<'a> Solver<'a> for LsOmp<'a> {
         Some(self.return_reindexed_solution())
     }
 
-    fn solver_type_name(&self) -> String {
+    fn name(&self) -> String {
         "ls-omp".to_string()
     }
 }
@@ -787,7 +796,7 @@ impl<'a> Solver<'a> for Mp<'a> {
         Some(self.running_solution.cloned())
     }
 
-    fn solver_type_name(&self) -> String {
+    fn name(&self) -> String {
         "mp".to_string()
     }
 }
@@ -884,7 +893,7 @@ impl<'a> Solver<'a> for WeakMp<'a> {
         Some(self.running_solution.cloned())
     }
 
-    fn solver_type_name(&self) -> String {
+    fn name(&self) -> String {
         "weak-mp".to_string()
     }
 }
@@ -893,6 +902,16 @@ pub struct Thresholding<'a> {
     config: &'a BaseConfig<'a>,
     inner_products: Col<f64>,
     a_sup: Mat<f64>,
+    // Reserve space for running solution.
+    running_solution: Col<f64>,
+    // Buffer requirements to trigger reallocation if needed
+    allocated_buf_req: StackReq,
+    h_factor: Mat<f64>,
+    // Space to write QR decomposition in.
+    // Reuse over iterations.
+    qr_mat: Mat<f64>,
+    // Allocated memory for efficient qr solve
+    buf: MemBuffer,
 }
 
 impl<'a> Thresholding<'a> {
@@ -905,26 +924,47 @@ impl<'a> Thresholding<'a> {
             1.0,
             Par::Seq,
         );
+        self.inner_products.iter_mut().for_each(|e| *e = e.abs());
     }
 
     fn sort_indicies(&self) -> Vec<usize> {
         let mut indicies: Vec<usize> = (0..self.inner_products.nrows()).collect();
-        indicies.sort_by(|&i, &j| {
-            self.inner_products[j]
-                .abs()
-                .total_cmp(&self.inner_products[i].abs())
-        });
+        indicies.sort_by(|&i, &j| self.inner_products[j].total_cmp(&self.inner_products[i]));
         indicies
     }
 
-    fn solve_lstsq_a_sup(&self) -> Col<f64> {
-        let qr = self.a_sup.col_piv_qr();
-        qr.solve_lstsq(self.config.b_ref)
+    fn increase_allocated_memory(&mut self) {
+        // increases memory according to self.a_sup
+        let (nrows, ncols) = (self.a_sup.nrows(), self.a_sup.ncols());
+        let (rank, block_size) = calculate_h_factor_req(nrows, ncols);
+        self.h_factor.resize_with(block_size, rank, |_, _| 0.0);
+        self.qr_mat.resize_with(nrows, ncols, |_, _| 0.0);
+        self.running_solution
+            .resize_with(self.config.b_ref.nrows(), |_| 0.0);
+        let new_req = calculate_stack_req(nrows, ncols);
+        if new_req.size_bytes() > self.allocated_buf_req.size_bytes() {
+            self.buf = allocate_buffer(calculate_stack_req(nrows, (ncols - 1) * 2));
+        }
     }
 
-    fn reindex_solution(&self, indicies: &[usize], x: &Col<f64>) -> Col<f64> {
+    fn update_running_solution(&mut self) {
+        /*
+        Solve Lstsq using a_sub and b.
+        We want to find a sparse solution, thus this step should not be called to many times.
+        */
+        self.qr_mat.copy_from(self.a_sup.rb());
+        solve_qr_inplace(
+            &mut self.qr_mat,
+            &mut self.h_factor,
+            self.config.b_ref,
+            &mut self.running_solution,
+            &mut self.buf,
+        );
+    }
+
+    fn reindex_solution(&self, indicies: &[usize]) -> Col<f64> {
         let mut running_solution = Col::zeros(self.config.a_ref.ncols());
-        for (x_i, &j_i) in x.iter().zip(indicies.iter()) {
+        for (x_i, &j_i) in self.running_solution.iter().zip(indicies.iter()) {
             running_solution[j_i] = *x_i;
         }
         running_solution
@@ -938,7 +978,8 @@ impl<'a> Solver<'a> for Thresholding<'a> {
         let support_indicies = self.sort_indicies();
         for &idx in support_indicies.iter() {
             self.a_sup.push_col(self.config.a_ref.col(idx));
-            let x = self.solve_lstsq_a_sup();
+            self.increase_allocated_memory();
+            self.update_running_solution();
 
             running_residual.copy_from(self.config.b_ref);
             //update running_residual
@@ -946,36 +987,38 @@ impl<'a> Solver<'a> for Thresholding<'a> {
                 running_residual.rb_mut(),
                 Accum::Add,
                 self.a_sup.rb(),
-                x.rb(),
+                self.running_solution.rb(),
                 -1.0,
                 Par::Seq,
             );
 
             if running_residual.squared_norm_l2() < self.config.sq_error_threshold {
-                return Some(self.reindex_solution(&support_indicies, &x));
+                return Some(self.reindex_solution(&support_indicies));
             }
         }
-        todo!("impl solve")
+        // Solution lies in the null space of A
+        None
     }
 
     fn solve_n_nonzero_coefs(&mut self, support_cardinality: usize) -> Option<Col<f64>> {
-        //resize a_sup to n_nonzero coefs.
+        // Resize a_sup to n_nonzero coefs.
         self.a_sup
             .reserve(self.config.a_ref.nrows(), support_cardinality);
 
         self.compute_inner_products();
         let support_indicies = self.sort_indicies();
-        // fill a_sup with columns in question
+        // Fill a_sup with columns in question
         support_indicies
             .iter()
             .take(support_cardinality)
             .for_each(|&idx| self.a_sup.push_col(self.config.a_ref.col(idx)));
 
-        let x = self.solve_lstsq_a_sup();
-        Some(self.reindex_solution(&support_indicies, &x))
+        self.increase_allocated_memory();
+        self.update_running_solution();
+        Some(self.reindex_solution(&support_indicies))
     }
 
-    fn solver_type_name(&self) -> String {
+    fn name(&self) -> String {
         "thresholding".to_string()
     }
 }
@@ -988,10 +1031,21 @@ impl<'a> Initializable<'a, BaseConfig<'a>> for Thresholding<'a> {
         unsafe {
             a_sup.set_dims(config.a_ref.nrows(), 0);
         }
+        let req = calculate_stack_req(config.a_ref.nrows(), config.expected_size);
+        let (rank, block_size) = calculate_h_factor_req(config.a_ref.nrows(), config.expected_size);
+        let buf = allocate_buffer(req);
+        let h_factor = Mat::with_capacity(block_size, rank);
+        let qr_mat = Mat::with_capacity(config.a_ref.nrows(), config.expected_size);
+        let running_solution = Col::zeros(config.b_ref.nrows());
         Thresholding {
+            running_solution,
             config,
             inner_products,
             a_sup,
+            allocated_buf_req: req,
+            buf,
+            h_factor,
+            qr_mat,
         }
     }
 }

@@ -138,6 +138,7 @@ pub fn calc_solution_support_dist(x: &Col<f64>, x_cand: &Col<f64>) -> f64 {
         / x_sup.len().max(x_cand_sup.len()) as f64
 }
 
+#[allow(unused)]
 pub mod experiments {
     use faer::Col;
 
@@ -153,10 +154,7 @@ pub mod experiments {
     use std::hint::black_box;
     use std::time::Instant;
 
-    fn measure_time_solve_fixed_cardinality<'a, S>(
-        s: &mut S,
-        card: usize,
-    ) -> Option<(f64, Col<f64>)>
+    fn measure_solve_fixed_cardinality<'a, S>(s: &mut S, card: usize) -> Option<(f64, Col<f64>)>
     where
         S: Solver<'a> + ?Sized,
     {
@@ -169,7 +167,7 @@ pub mod experiments {
         }
     }
 
-    fn measure_time_solve<'a, S>(s: &mut S) -> Option<(f64, Col<f64>)>
+    fn measure_solve<'a, S>(s: &mut S) -> Option<(f64, Col<f64>)>
     where
         S: Solver<'a> + ?Sized,
     {
@@ -186,7 +184,7 @@ pub mod experiments {
         nrepeats: usize,
         nrows: usize,
         ncols: usize,
-        solution_caridnalities: &[usize],
+        solution_cardinalities: &[usize],
     ) -> Result<(), Box<dyn Error>> {
         let mut writer = Writer::from_path(file_path)?;
         writer.write_record([
@@ -196,7 +194,7 @@ pub mod experiments {
             "l2_recovery_error",
             "solution_support_distance",
         ])?;
-        for &solution_cardinality in solution_caridnalities {
+        for &solution_cardinality in solution_cardinalities {
             for i in 0..nrepeats {
                 let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
                 let config = BaseConfig::init(&a, &b, 1.0e-6, b.nrows() / 5);
@@ -217,13 +215,13 @@ pub mod experiments {
                 ];
 
                 for s in &mut solvers {
-                    let res = measure_time_solve(s.as_mut());
+                    let res = measure_solve(s.as_mut());
                     match res {
                         Some((time, x_opt)) => {
                             let l2_error = calc_solution_l2_error(&x, &x_opt);
                             let support_dist = calc_solution_support_dist(&x, &x_opt);
                             writer.write_record([
-                                s.solver_type_name(),
+                                s.name(),
                                 // "omp".to_string(),
                                 solution_cardinality.to_string(),
                                 time.to_string(),
@@ -234,7 +232,7 @@ pub mod experiments {
                         None => {
                             println!(
                                 "could not solve problem {}, card: {solution_cardinality}, rep: {i}",
-                                s.solver_type_name()
+                                s.name()
                             );
                         }
                     }
@@ -249,7 +247,7 @@ pub mod experiments {
         nrepeats: usize,
         nrows: usize,
         ncols: usize,
-        solution_caridnalities: &[usize],
+        solution_cardinalities: &[usize],
     ) -> Result<(), Box<dyn Error>> {
         let mut writer = Writer::from_path(file_path)?;
         writer.write_record([
@@ -259,7 +257,7 @@ pub mod experiments {
             "l2_recovery_error",
             "solution_support_distance",
         ])?;
-        for &solution_cardinality in solution_caridnalities {
+        for &solution_cardinality in solution_cardinalities {
             for i in 0..nrepeats {
                 let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
                 let config = BaseConfig::init(&a, &b, 1.0e-6, solution_cardinality);
@@ -280,14 +278,13 @@ pub mod experiments {
                 ];
 
                 for s in &mut solvers {
-                    let res =
-                        measure_time_solve_fixed_cardinality(s.as_mut(), solution_cardinality);
+                    let res = measure_solve_fixed_cardinality(s.as_mut(), solution_cardinality);
                     match res {
                         Some((time, x_opt)) => {
                             let l2_error = calc_solution_l2_error(&x, &x_opt);
                             let support_dist = calc_solution_support_dist(&x, &x_opt);
                             writer.write_record([
-                                s.solver_type_name(),
+                                s.name(),
                                 // "omp".to_string(),
                                 solution_cardinality.to_string(),
                                 time.to_string(),
@@ -298,7 +295,71 @@ pub mod experiments {
                         None => {
                             println!(
                                 "could not solve problem {}, card: {solution_cardinality}, rep: {i}",
-                                s.solver_type_name()
+                                s.name()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn repeated_random_error_threshold_comparisons(
+        file_path: &str,
+        nrepeats: usize,
+        nrows: usize,
+        ncols: usize,
+        solution_cardinality: usize,
+        error_thresholds: &[f64],
+    ) -> Result<(), Box<dyn Error>> {
+        let mut writer = Writer::from_path(file_path)?;
+        writer.write_record([
+            "algorithm",
+            "threshold",
+            "time",
+            "l2_recovery_error",
+            "solution_support_distance",
+        ])?;
+        for i in 0..nrepeats {
+            let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
+            for &error_threshold in error_thresholds {
+                let config = BaseConfig::init(&a, &b, error_threshold, solution_cardinality);
+                let weak_config =
+                    WeakMpConfig::init(&a, &b, error_threshold, solution_cardinality, 0.5);
+
+                let omp: Omp = init_solver(black_box(&config));
+                let ls_omp: LsOmp = init_solver(black_box(&config));
+                let mp: Mp = init_solver(black_box(&config));
+                let weak_mp: WeakMp = init_solver(black_box(&weak_config));
+                let thresh: Thresholding = init_solver(black_box(&config));
+
+                let mut solvers: Vec<Box<dyn Solver>> = vec![
+                    Box::new(omp),
+                    Box::new(ls_omp),
+                    Box::new(mp),
+                    Box::new(weak_mp),
+                    Box::new(thresh),
+                ];
+
+                for s in &mut solvers {
+                    let res = measure_solve(s.as_mut());
+                    match res {
+                        Some((time, x_opt)) => {
+                            let l2_error = calc_solution_l2_error(&x, &x_opt);
+                            let support_dist = calc_solution_support_dist(&x, &x_opt);
+                            writer.write_record([
+                                s.name(),
+                                format!("{:.2e}", error_threshold),
+                                time.to_string(),
+                                format!("{:.6e}", l2_error),
+                                format!("{:.6e}", support_dist),
+                            ])?;
+                        }
+                        None => {
+                            println!(
+                                "could not solve problem {}, threshold: {error_threshold}, rep: {i}",
+                                s.name()
                             );
                         }
                     }
