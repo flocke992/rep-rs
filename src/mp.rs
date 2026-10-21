@@ -11,13 +11,19 @@
 
 use std::collections::HashSet;
 
+use faer::Accum::Replace;
+use faer::diag::Diag;
 use faer::dyn_stack::{MemBuffer, MemStack, StackReq};
 use faer::linalg::matmul::dot::inner_prod;
 use faer::linalg::matmul::matmul;
 use faer::linalg::qr::no_pivoting::factor;
+use faer::linalg::svd::ComputeSvdVectors::Full;
+use faer::linalg::svd::{SvdError, pseudoinverse_from_svd, pseudoinverse_from_svd_scratch};
+use faer::linalg::svd::{svd, svd_scratch};
 use faer::linalg::{householder, triangular_solve};
-use faer::reborrow::*;
+use faer::prelude::default;
 use faer::{Accum, Col, Mat, Par, unzip, zip};
+use faer::{MatMut, MatRef, reborrow::*};
 
 pub trait Solver<'a> {
     // Solve to approx machine precision.
@@ -277,16 +283,6 @@ impl<'a> Omp<'a> {
             -1.0,
             Par::Seq,
         );
-
-        // matmul(
-        //     self.running_residual.rb_mut(),
-        //     Accum::Replace,
-        //     self.a_sup.rb(),
-        //     self.running_solution.rb(),
-        //     1.0,
-        //     Par::Seq,
-        // );
-        // zip!(&mut self.running_residual, self.config.b_ref).for_each(|unzip!(r, b)| *r = b - *r);
     }
 }
 
@@ -1046,6 +1042,206 @@ impl<'a> Initializable<'a, BaseConfig<'a>> for Thresholding<'a> {
             buf,
             h_factor,
             qr_mat,
+        }
+    }
+}
+
+pub struct Irls<'a> {
+    // Reserve space for running solution.
+    max_iter: usize,
+    running_solution: Col<f64>,
+    old_solution: Col<f64>,
+    config: &'a BaseConfig<'a>,
+    weights: Diag<f64>,
+    // Allocated Space for computations TODO: optimize space here
+    pinv: Mat<f64>,
+    s: Diag<f64>,
+    u: Mat<f64>,
+    v: Mat<f64>,
+    buf: MemBuffer,
+    a_w_sq: Mat<f64>,
+}
+
+fn diag_mul(dst: MatMut<'_, f64>, d: &Diag<f64>, a: MatRef<'_, f64>) {
+    assert_eq!(dst.nrows(), a.nrows());
+    assert_eq!(dst.ncols(), a.ncols());
+    assert_eq!(d.dim(), a.nrows());
+
+    let d = d.column_vector();
+    for (dst_j, a_j) in dst.col_iter_mut().zip(a.col_iter()) {
+        zip!(dst_j, a_j, d).for_each(|unzip!(dst_ji, a_ji, d_i)| *dst_ji = *a_ji * d_i);
+    }
+}
+
+impl<'a> Irls<'a> {
+    fn update_weights(&mut self) {
+        // we can compute W^2, because we only need this in later computations.
+        self.weights
+            .column_vector_mut()
+            .iter_mut()
+            .zip(self.running_solution.iter())
+            .for_each(|(w_i, x_i)| *w_i = x_i.abs());
+    }
+
+    fn check_convergence(&self) -> bool {
+        (self.running_solution.rb() - self.old_solution.rb()).squared_norm_l2()
+            < self.config.sq_error_threshold
+    }
+
+    //TODO: Optimize for thin svd
+    fn iteration_step(&mut self) -> Result<(), SvdError> {
+        // compute running_solution = (weights)^2 @ A^T @ (A weights ^2 A^T)^(dagger) @ b
+
+        // weights^2 @ A^T
+        diag_mul(
+            self.a_w_sq.rb_mut(),
+            &self.weights,
+            self.config.a_ref.transpose(),
+        );
+
+        // A @ weights^2 @ A^T
+        matmul(
+            self.pinv.rb_mut(),
+            Replace,
+            self.config.a_ref,
+            self.a_w_sq.rb(),
+            1.0,
+            Par::Seq,
+        );
+
+        // (A @ weights^2 @ A^T)^(dagger)
+        let stack = MemStack::new(&mut self.buf);
+        svd(
+            self.pinv.rb(),
+            self.s.rb_mut(),
+            Some(self.u.rb_mut()),
+            Some(self.v.rb_mut()),
+            Par::Seq,
+            stack,
+            default(),
+        )?;
+        pseudoinverse_from_svd(
+            self.pinv.rb_mut(),
+            self.s.rb(),
+            self.u.rb(),
+            self.v.rb(),
+            Par::Seq,
+            stack,
+        );
+
+        // (A @ weights^2 @ A^T)^(dagger) @ b
+        let mut space = self.v.col_mut(0);
+        matmul(
+            space.rb_mut(),
+            Replace,
+            self.pinv.rb(),
+            self.config.b_ref,
+            1.0,
+            Par::Seq,
+        );
+        matmul(
+            self.running_solution.rb_mut(),
+            Replace,
+            self.a_w_sq.rb(),
+            space.rb(),
+            1.0,
+            Par::Seq,
+        );
+        Ok(())
+    }
+}
+
+impl<'a> Initializable<'a, BaseConfig<'a>> for Irls<'a> {
+    fn init(config: &'a BaseConfig) -> Self {
+        let buf = allocate_buffer(StackReq::any_of(&[
+            svd_scratch::<f64>(
+                config.a_ref.nrows(),
+                config.a_ref.nrows(),
+                Full,
+                Full,
+                Par::Seq,
+                default(),
+            ),
+            pseudoinverse_from_svd_scratch::<f64>(
+                config.a_ref.nrows(),
+                config.a_ref.nrows(),
+                Par::Seq,
+            ),
+        ]));
+        Self {
+            max_iter: config.a_ref.ncols() * 5, //TODO: optimize here
+            running_solution: Col::ones(config.a_ref.ncols()),
+            old_solution: Col::zeros(config.a_ref.ncols()),
+            config,
+            weights: Diag::ones(config.a_ref.ncols()),
+            pinv: Mat::zeros(config.a_ref.nrows(), config.a_ref.nrows()),
+            s: Diag::zeros(config.a_ref.nrows()),
+            u: Mat::zeros(config.a_ref.nrows(), config.a_ref.nrows()),
+            v: Mat::zeros(config.a_ref.nrows(), config.a_ref.nrows()),
+            buf: buf,
+            a_w_sq: Mat::zeros(config.a_ref.ncols(), config.a_ref.nrows()),
+        }
+    }
+}
+
+impl<'a> Solver<'a> for Irls<'a> {
+    fn solve(&mut self) -> Option<Col<f64>> {
+        for _i in 0..self.max_iter {
+            self.iteration_step().ok()?;
+            self.update_weights();
+            if self.check_convergence() {
+                return Some(self.running_solution.cloned());
+            } else {
+                self.old_solution.copy_from(&self.running_solution);
+            }
+        }
+        None
+    }
+
+    //TODO: is there a way to implement this?
+    fn solve_n_nonzero_coefs(&mut self, _support_cardinality: usize) -> Option<Col<f64>> {
+        todo!();
+    }
+
+    fn name(&self) -> String {
+        "irls".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const N: usize = 5;
+    const M: usize = 3;
+    fn setup() -> (Diag<f64>, Mat<f64>) {
+        let a = Mat::from_fn(N, M, |i, j| (i * 10 + j) as f64 + 0.5);
+        let d: Diag<f64> = Col::from_fn(N, |i| (i + 1) as f64 * 2.0).into_diagonal();
+        (d, a)
+    }
+
+    #[test]
+    fn left_diag() {
+        let (d, a) = setup();
+
+        let mut out = Mat::<f64>::zeros(N, M);
+        diag_mul(out.rb_mut(), &d, a.as_ref());
+
+        let dense = Mat::from_fn(N, N, |i, j| {
+            if i == j {
+                d.as_ref().column_vector()[i]
+            } else {
+                0.0
+            }
+        });
+        let expected = &dense * &a;
+        for i in 0..N {
+            for j in 0..M {
+                assert!(
+                    (out[(i, j)] - expected[(i, j)]).abs() < 1.0e-12,
+                    "missmatch at ({i}, {j})"
+                );
+            }
         }
     }
 }
