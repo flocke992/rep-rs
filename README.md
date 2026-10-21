@@ -21,6 +21,6 @@ $$\frac{\text{max}\{|\hat{S}|,|S|\}-|\hat{S}\cap S|}{\text{max}\{|\hat{S}|,|S|\}
 where $S$ is the true support set and $\hat{S}$ is the candidate support set and the time in seconds until the algorithm finishes.
 The dimensions of $m$ and $n$ are given by $30\times 50$ and $60\times 100$ respectively
 
-![small_exp](./performance1.png)
+![small_exp](./inspections/performance1.png)
 
-![big_exp](./performance2.png)
+![big_exp](./inspections/performance2.png)
