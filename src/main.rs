@@ -1,7 +1,4 @@
-use crate::{
-    inspection::gen_ax_b,
-    mp::{BaseConfig, Initializable, Solver, WeakMpConfig},
-};
+use crate::mp::{BpConfig, Initializable, MpConfig, Solver, WeakMpConfig};
 
 mod inspection;
 mod mp;
@@ -52,29 +49,31 @@ fn main() {
     //
     // println!("Done testing");
 
-    let (a, x, b) = inspection::gen_ax_b(50, 120, 10);
-    let conf = BaseConfig::init(&a, &b, 1.0e-6, 10);
-    // // let weakconf = WeakMpConfig::init(&a, &b, 1.0e-6, b.nrows() / 5, 0.5);
-    //
-    // // println!("True solution: {:.3?}", x);
-    println!("OMP:");
-    let mut problem = mp::Omp::init(&conf);
-    if let Some(x_cand) = problem.solve() {
-        let l2_error = inspection::calc_solution_l2_error(&x, &x_cand);
-        let support_dist = inspection::calc_solution_support_dist(&x, &x_cand);
-        // println!("cand solution: {:.3?}", x_cand);
-        println!("l2 error: {l2_error:.4e}");
-        println!("support dist: {support_dist:.4e}");
-    }
-    println!("irls:");
-    let mut problem = mp::Irls::init(&conf);
-    if let Some(x_cand) = problem.solve() {
-        let l2_error = inspection::calc_solution_l2_error(&x, &x_cand);
-        let support_dist = inspection::calc_solution_support_dist(&x, &x_cand);
-        // println!("cand solution: {:.3?}", x_cand);
-        println!("l2 error: {l2_error:.4e}");
-        println!("support dist: {support_dist:.4e}");
-    }
+    // let (a, x, b) = inspection::gen_ax_b(5, 12, 3);
+    // let conf = MpConfig::init(&a, &b, 1.0e-6, 10);
+    // // // let weakconf = WeakMpConfig::init(&a, &b, 1.0e-6, b.nrows() / 5, 0.5);
+    // //
+    // // // println!("True solution: {:.3?}", x);
+    // println!("OMP:");
+    // let mut problem = mp::Omp::init(&conf);
+    // if let Some(x_cand) = problem.solve() {
+    //     let l2_error = inspection::calc_solution_l2_error(&x, &x_cand);
+    //     let support_dist = inspection::calc_solution_support_dist(&x, &x_cand);
+    //     // println!("cand solution: {:.3?}", x_cand);
+    //     println!("l2 error: {l2_error:.4e}");
+    //     println!("support dist: {support_dist:.4e}");
+    // }
+    // println!("irls:");
+    // let bp_conf = BpConfig::init(&a, &b, 1.0e-6, 1.0e-14, a.ncols() * 20);
+    // let mut problem = mp::Irls::init(&bp_conf);
+    // if let Some(x_cand) = problem.solve() {
+    //     let l2_error = inspection::calc_solution_l2_error(&x, &x_cand);
+    //     let support_dist = inspection::calc_solution_support_dist(&x, &x_cand);
+    //     // println!("cand solution: {:.3?}", x_cand);
+    //     println!("l2 error: {l2_error:.4e}");
+    //     println!("support dist: {support_dist:.4e}");
+    // }
+
     //
     // println!("Thresholding:");
     // let mut problem = mp::Thresholding::init(&conf);

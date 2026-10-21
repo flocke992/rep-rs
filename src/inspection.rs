@@ -146,7 +146,7 @@ pub mod experiments {
         calc_solution_l2_error, calc_solution_support_dist, gen_ax_b, gen_ax_b_exact,
     };
     use crate::mp::{
-        BaseConfig, Initializable, LsOmp, Mp, Omp, Solver, Thresholding, WeakMp, WeakMpConfig,
+        Initializable, LsOmp, Mp, MpConfig, Omp, Solver, Thresholding, WeakMp, WeakMpConfig,
         init_solver,
     };
     use csv::Writer;
@@ -197,7 +197,7 @@ pub mod experiments {
         for &solution_cardinality in solution_cardinalities {
             for i in 0..nrepeats {
                 let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
-                let config = BaseConfig::init(&a, &b, 1.0e-6, b.nrows() / 5);
+                let config = MpConfig::init(&a, &b, 1.0e-6, b.nrows() / 5);
                 let weak_config = WeakMpConfig::init(&a, &b, 1.0e-6, b.nrows() / 5, 0.5);
 
                 let omp: Omp = init_solver(black_box(&config));
@@ -260,7 +260,7 @@ pub mod experiments {
         for &solution_cardinality in solution_cardinalities {
             for i in 0..nrepeats {
                 let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
-                let config = BaseConfig::init(&a, &b, 1.0e-6, solution_cardinality);
+                let config = MpConfig::init(&a, &b, 1.0e-6, solution_cardinality);
                 let weak_config = WeakMpConfig::init(&a, &b, 1.0e-6, solution_cardinality, 0.5);
 
                 let omp: Omp = init_solver(black_box(&config));
@@ -324,7 +324,7 @@ pub mod experiments {
         for i in 0..nrepeats {
             let (a, x, b) = gen_ax_b_exact(nrows, ncols, solution_cardinality);
             for &error_threshold in error_thresholds {
-                let config = BaseConfig::init(&a, &b, error_threshold, solution_cardinality);
+                let config = MpConfig::init(&a, &b, error_threshold, solution_cardinality);
                 let weak_config =
                     WeakMpConfig::init(&a, &b, error_threshold, solution_cardinality, 0.5);
 
